@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 SOURCE_URL = "https://www.walshkokosing.com/bsbc-current-opportunities"
 
+# Airtable batch APIs allow up to 10 records per request.
+AIRTABLE_BATCH_SIZE = 10
 
 CATEGORY_KEYWORDS: Dict[str, List[str]] = {
     "Concrete": ["concrete", "curb", "sidewalk", "slab", "rebar"],
@@ -133,6 +135,7 @@ def parse_html_table(html: str) -> List[Opportunity]:
         scope_number = get_col("scope number")
         if not scope_number:
             continue
+
         rows.append(
             Opportunity(
                 scope_number=scope_number,
@@ -144,6 +147,7 @@ def parse_html_table(html: str) -> List[Opportunity]:
                 quotes_due=get_col("quotes due", "deadline/quotes due"),
             )
         )
+
     return rows
 
 
@@ -174,42 +178,70 @@ def scrape_direct(url: str = SOURCE_URL) -> List[Opportunity]:
 
 
 class AirtableClient:
-    def __init__(self, api_key: str, base_id: str, table_name: str) -> None:
-        self.base_url = f"https://api.airtable.com/v0/{base_id}/{table_name}"
+    def __init__(self, api_key: str, base_id: str, table_name_or_id: str) -> None:
+        self.base_url = f"https://api.airtable.com/v0/{base_id}/{table_name_or_id}"
         self.session = requests.Session()
-        self.session.headers.update({"Authorization": f"Bearer {api_key}"})
+        self.session.headers.update({
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        })
 
-    def find_by_scope(self, scope_number: str) -> Optional[str]:
-        formula = f"{{Scope Number}} = '{scope_number.replace("'", "\\'")}'"
-        resp = self.session.get(self.base_url, params={"filterByFormula": formula, "maxRecords": 1}, timeout=30)
-        resp.raise_for_status()
-        records = resp.json().get("records", [])
-        return records[0]["id"] if records else None
-
-    def upsert(self, opp: Opportunity) -> str:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        fields = {
-            "Scope Number": opp.scope_number,
-            "Phase": opp.phase,
-            "Scope Description": opp.scope_description,
-            "Price Range": opp.price_range,
-            "Scope Status": opp.scope_status,
-            "Release for Bid": _date_or_text(opp.release_for_bid),
-            "Deadline/Quotes Due": _date_or_text(opp.quotes_due),
-            "Source URL": opp.source_url,
-            "Last Scraped": now_iso,
-            "Categories": opp.categories or ["Other"],
-        }
-
-        existing_id = self.find_by_scope(opp.scope_number)
-        if existing_id:
-            resp = self.session.patch(f"{self.base_url}/{existing_id}", json={"fields": fields}, timeout=30)
+    def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
+        # Airtable rate limits are common; retry once on 429 using Retry-After.
+        resp = self.session.request(method, url, timeout=30, **kwargs)
+        if resp.status_code != 429:
             resp.raise_for_status()
-            return "updated"
+            return resp
 
-        resp = self.session.post(self.base_url, json={"fields": fields}, timeout=30)
-        resp.raise_for_status()
-        return "created"
+        retry_after = int(resp.headers.get("Retry-After", "2"))
+        import time
+
+        time.sleep(retry_after)
+        retry_resp = self.session.request(method, url, timeout=30, **kwargs)
+        retry_resp.raise_for_status()
+        return retry_resp
+
+    def upsert_batch(self, records: List[Dict[str, object]], merge_field: str = "Scope Number") -> Dict[str, int]:
+        created = 0
+        updated = 0
+
+        for i in range(0, len(records), AIRTABLE_BATCH_SIZE):
+            chunk = records[i : i + AIRTABLE_BATCH_SIZE]
+            payload = {
+                "performUpsert": {"fieldsToMergeOn": [merge_field]},
+                "records": [{"fields": r} for r in chunk],
+                "typecast": True,
+            }
+            resp = self._request_with_retry("POST", self.base_url, json=payload)
+            body = resp.json()
+            created_ids = body.get("createdRecords", [])
+            created += len(created_ids)
+            updated += max(0, len(chunk) - len(created_ids))
+
+        return {"created": created, "updated": updated}
+
+
+def build_airtable_fields(opp: Opportunity, include_categories: bool = True) -> Dict[str, object]:
+    fields: Dict[str, object] = {
+        "Scope Number": opp.scope_number,
+        "Phase": opp.phase,
+        "Scope Description": opp.scope_description,
+        "Price Range": opp.price_range,
+        "Scope Status": opp.scope_status,
+        "Release for Bid": _date_or_text(opp.release_for_bid),
+        "Deadline/Quotes Due": _date_or_text(opp.quotes_due),
+        "Source URL": opp.source_url,
+        "Last Scraped": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if include_categories:
+        fields["Categories"] = opp.categories or ["Other"]
+
+    # Optional convenience field if present in base.
+    if opp.scope_number and opp.scope_description:
+        fields["Bid Title"] = f"{opp.scope_number} — {opp.scope_description[:80]}"
+
+    return fields
 
 
 def run_once() -> Dict[str, int]:
@@ -225,21 +257,29 @@ def run_once() -> Dict[str, int]:
     if not rows:
         raise RuntimeError("Scrape returned 0 rows")
 
-    client = AirtableClient(airtable_key, airtable_base, airtable_table)
-    created = 0
-    updated = 0
-
     for opp in rows:
         opp.release_for_bid = _date_or_text(opp.release_for_bid)
         opp.quotes_due = _date_or_text(opp.quotes_due)
         opp.categories = categorize(opp)
-        result = client.upsert(opp)
-        if result == "created":
-            created += 1
-        else:
-            updated += 1
 
-    return {"total": len(rows), "created": created, "updated": updated}
+    client = AirtableClient(airtable_key, airtable_base, airtable_table)
+
+    # Some bases may not have Categories yet. Retry without it if Airtable rejects field.
+    try:
+        result = client.upsert_batch([build_airtable_fields(opp, include_categories=True) for opp in rows])
+    except requests.HTTPError as exc:
+        message = ""
+        if exc.response is not None:
+            try:
+                message = json.dumps(exc.response.json())
+            except Exception:
+                message = exc.response.text
+
+        if "Unknown field name: \"Categories\"" not in message:
+            raise
+        result = client.upsert_batch([build_airtable_fields(opp, include_categories=False) for opp in rows])
+
+    return {"total": len(rows), **result}
 
 
 def serve_dashboard(host: str = "0.0.0.0", port: int = 8787) -> None:

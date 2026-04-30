@@ -1,4 +1,10 @@
-from src.wk_automation import Opportunity, categorize, parse_markdown_table, parse_html_table
+from src.wk_automation import (
+    Opportunity,
+    build_airtable_fields,
+    categorize,
+    parse_html_table,
+    parse_markdown_table,
+)
 
 
 def test_categorize_multi_match():
@@ -31,3 +37,11 @@ def test_parse_html_table():
     rows = parse_html_table(html)
     assert len(rows) == 1
     assert rows[0].scope_description == "Sitework grading"
+
+
+def test_build_airtable_fields_without_categories():
+    opp = Opportunity(scope_number="10", scope_description="Utility work")
+    fields = build_airtable_fields(opp, include_categories=False)
+    assert "Categories" not in fields
+    assert fields["Scope Number"] == "10"
+    assert "Bid Title" in fields

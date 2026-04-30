@@ -1,17 +1,17 @@
 # Walsh Kokosing → Airtable Automation
 
-This repo now contains a production-ready Python automation that replaces the original n8n-only concept.
+This repository contains a Python automation service that replaces the original n8n plan for daily sync.
 
 ## What it does
 
 - Scrapes `https://www.walshkokosing.com/bsbc-current-opportunities` daily at **2:00 AM America/New_York**.
-- Uses **Firecrawl** when `FIRECRAWL_API_KEY` is provided; otherwise falls back to direct HTML scraping.
-- Parses opportunities into structured records.
-- Normalizes text and safely handles non-date deadline/status values.
-- Assigns deterministic, multi-label categories.
-- Upserts records into Airtable by `Scope Number`.
-- Updates `Last Scraped` on every touched record.
-- Includes a tiny API/UI surface for manual trigger (`POST /run`) and health checks (`GET /health`).
+- Uses **Firecrawl** when `FIRECRAWL_API_KEY` is set; otherwise falls back to direct HTML scraping.
+- Parses rows into normalized opportunity records.
+- Categorizes opportunities deterministically based on keyword rules.
+- Upserts into Airtable idempotently by `Scope Number`.
+- Updates `Last Scraped` on every touched row.
+- Supports Airtable batch upsert with retry on 429 rate limits.
+- Gracefully retries without `Categories` if that field is not present yet.
 
 ## Setup
 
@@ -22,52 +22,56 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Then set your credentials in `.env` or environment variables.
+Populate environment variables:
+
+- `AIRTABLE_API_KEY`
+- `AIRTABLE_BASE_ID`
+- `AIRTABLE_TABLE_NAME` (name or table ID; defaults to `Opportunities`)
+- `FIRECRAWL_API_KEY` (optional but recommended)
 
 ## Run modes
 
-### 1) One-time sync
+### One-time sync
 
 ```bash
 python src/wk_automation.py --once
 ```
 
-### 2) Daily scheduled sync (2:00 AM ET)
+### Daily scheduler (2:00 AM ET)
 
 ```bash
 python src/wk_automation.py --schedule
 ```
 
-### 3) Minimal ops endpoint
+### Minimal API/UI surface
 
 ```bash
 python src/wk_automation.py --serve
 ```
 
-- `GET /health` → service heartbeat
-- `POST /run` → trigger a sync now
+- `GET /health`
+- `POST /run`
 
-## What I changed versus your original n8n spec
+## Airtable field expectations
 
-- Kept your exact pipeline behavior (scrape → parse → categorize → upsert).
-- Implemented idempotent Airtable upsert in code instead of n8n graph nodes.
-- Added direct scrape fallback so the system still runs if Firecrawl is unavailable.
-- Added a small operations API to reduce your manual work.
+Expected columns in **Opportunities** table:
 
-## Inputs still needed from you
+- `Scope Number` (used as merge key)
+- `Phase`
+- `Scope Description`
+- `Price Range`
+- `Scope Status`
+- `Release for Bid`
+- `Deadline/Quotes Due`
+- `Source URL`
+- `Last Scraped`
 
-1. Airtable credentials:
-   - `AIRTABLE_API_KEY`
-   - `AIRTABLE_BASE_ID`
-   - `AIRTABLE_TABLE_NAME` (defaults to `Opportunities`)
-2. Optional but recommended: `FIRECRAWL_API_KEY`
-3. Confirm Airtable field types:
-   - `Categories` should be multi-select.
-   - `Last Scraped` should support date-time.
-   - `Release for Bid` and `Deadline/Quotes Due` can be date or text.
+Optional:
 
-## Suggested next upgrades
+- `Categories` (multi-select)
+- `Bid Title` (auto-filled as `Scope Number — truncated description` if field exists)
 
-- Add stateful run logs (SQLite/Postgres) and alerting (Slack/email) on 0-row scrape.
-- Add retry/backoff queue for Airtable 429 responses.
-- Add a richer web UI for run history and manual review of parse anomalies.
+## Notes
+
+- If date parsing fails (`Deferred`, `Pending Award`, etc.), values are sent as plain text.
+- If Airtable returns `Unknown field name: "Categories"`, the run retries automatically without that field.
