@@ -1,17 +1,25 @@
-# Walsh Kokosing → Airtable Automation
+# Walsh Kokosing → Airtable + Firm Matching Web App
 
-This repository contains a Python automation service that replaces the original n8n plan for daily sync.
+This project now includes both:
 
-## What it does
+1. Daily Walsh Kokosing opportunity scraping + Airtable upserts.
+2. A lightweight customer-facing web app for firm intake and match decisions.
 
-- Scrapes `https://www.walshkokosing.com/bsbc-current-opportunities` daily at **2:00 AM America/New_York**.
-- Uses **Firecrawl** when `FIRECRAWL_API_KEY` is set; otherwise falls back to direct HTML scraping.
-- Parses rows into normalized opportunity records.
-- Categorizes opportunities deterministically based on keyword rules.
-- Upserts into Airtable idempotently by `Scope Number`.
-- Updates `Last Scraped` on every touched row.
-- Supports Airtable batch upsert with retry on 429 rate limits.
-- Gracefully retries without `Categories` if that field is not present yet.
+## Customer-facing flow
+
+- Firm visits the site (`/`) and fills out an intake form (`/intake`) with business/contact/capabilities.
+- App stores firm profile in local SQLite.
+- App matches capabilities to scraped opportunities by deterministic category overlap.
+- Firm can view only their own matches via `/portal?email=...`.
+- Firm can click `Accept` or `Pass` per opportunity.
+
+## Automation flow
+
+- Scrape Walsh Kokosing opportunities (Firecrawl preferred, direct HTML fallback).
+- Normalize/parse/categorize rows.
+- Upsert to Airtable via batch `performUpsert` (Scope Number merge key).
+- Retry on Airtable 429 with `Retry-After`.
+- If `Categories` field is absent, retry payload without categories.
 
 ## Setup
 
@@ -22,56 +30,43 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Populate environment variables:
+Set environment variables:
 
 - `AIRTABLE_API_KEY`
 - `AIRTABLE_BASE_ID`
-- `AIRTABLE_TABLE_NAME` (name or table ID; defaults to `Opportunities`)
-- `FIRECRAWL_API_KEY` (optional but recommended)
+- `AIRTABLE_TABLE_NAME` (name or table ID)
+- `FIRECRAWL_API_KEY` (optional)
 
-## Run modes
+## Run
 
-### One-time sync
+### Run scrape+upsert once
 
 ```bash
 python src/wk_automation.py --once
 ```
 
-### Daily scheduler (2:00 AM ET)
+### Run scheduler (daily 2:00 AM America/New_York)
 
 ```bash
 python src/wk_automation.py --schedule
 ```
 
-### Minimal API/UI surface
+### Run web app (customer-facing)
 
 ```bash
 python src/wk_automation.py --serve
 ```
 
-- `GET /health`
-- `POST /run`
+Routes:
 
-## Airtable field expectations
+- `GET /` landing page
+- `GET/POST /intake` firm intake
+- `GET /portal?email=...` customer match portal
+- `GET /match/<id>/accept` decision endpoint
+- `GET /match/<id>/pass` decision endpoint
+- `POST /run` manually trigger scrape + matching
+- `GET /health` health status
 
-Expected columns in **Opportunities** table:
+## Optional no-site alternative
 
-- `Scope Number` (used as merge key)
-- `Phase`
-- `Scope Description`
-- `Price Range`
-- `Scope Status`
-- `Release for Bid`
-- `Deadline/Quotes Due`
-- `Source URL`
-- `Last Scraped`
-
-Optional:
-
-- `Categories` (multi-select)
-- `Bid Title` (auto-filled as `Scope Number — truncated description` if field exists)
-
-## Notes
-
-- If date parsing fails (`Deferred`, `Pending Award`, etc.), values are sent as plain text.
-- If Airtable returns `Unknown field name: "Categories"`, the run retries automatically without that field.
+If you prefer a Google Form initially, you can keep this backend and replace `/intake` with a webhook ingest endpoint later.

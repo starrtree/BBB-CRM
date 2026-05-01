@@ -1,7 +1,10 @@
+from pathlib import Path
+
 from src.wk_automation import (
     Opportunity,
     build_airtable_fields,
     categorize,
+    ensure_db,
     parse_html_table,
     parse_markdown_table,
 )
@@ -45,3 +48,9 @@ def test_build_airtable_fields_without_categories():
     assert "Categories" not in fields
     assert fields["Scope Number"] == "10"
     assert "Bid Title" in fields
+
+
+def test_ensure_db_creates_tables(tmp_path: Path):
+    db_path = tmp_path / "app.db"
+    ensure_db(db_path)
+    assert db_path.exists()
