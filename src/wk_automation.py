@@ -1,0 +1,808 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import sqlite3
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote
+
+SOURCE_URL = "https://www.walshkokosing.com/bsbc-current-opportunities"
+FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape"
+AIRTABLE_API_ROOT = "https://api.airtable.com/v0"
+AIRTABLE_BATCH_SIZE = 10
+DEFAULT_DB_PATH = Path(os.getenv("BRIDGE_DB_PATH", "data/app.db"))
+SCHEDULER_TIMEZONE = "America/New_York"
+SCHEDULER_HOUR = 2
+SCHEDULER_MINUTE = 0
+TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+logger = logging.getLogger("bbb_bridge_crm")
+LAST_RUN_SUMMARY: Optional[Dict[str, object]] = None
+
+CATEGORY_KEYWORDS: Dict[str, List[str]] = {
+    "Concrete": ["concrete", "curb", "sidewalk", "slab", "rebar"],
+    "Electrical": ["electrical", "conduit", "lighting", "signal"],
+    "Landscaping": ["landscape", "erosion", "seeding", "sod", "swppp"],
+    "HVAC": ["hvac", "duct", "air handler", "chiller"],
+    "Plumbing": ["plumbing", "sanitary", "sewer", "waterline", "pipe"],
+    "Demolition": ["demolition", "demo", "removal", "sawcut"],
+    "Earthwork": ["excavation", "earthwork", "grading"],
+    "Site Work": ["site work", "sitework"],
+    "Paving": ["paving", "asphalt"],
+    "Utilities": ["utilities", "storm", "drain", "drainage", "water main"],
+    "General Construction": ["general", "build", "construct"],
+}
+
+HEADER_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "scope_number": ("scope number", "scope #", "scope no", "scope"),
+    "phase": ("phase",),
+    "scope_description": ("scope description", "description", "scope desc"),
+    "price_range": ("price range", "range", "budget"),
+    "scope_status": ("scope status", "status"),
+    "release_for_bid": ("release for bid", "released for bid", "release date"),
+    "quotes_due": ("quotes due", "deadline/quotes due", "deadline", "due date", "bid due"),
+}
+
+
+@dataclass
+class Opportunity:
+    scope_number: str
+    phase: str = ""
+    scope_description: str = ""
+    price_range: str = ""
+    scope_status: str = ""
+    release_for_bid: str = ""
+    quotes_due: str = ""
+    source_url: str = SOURCE_URL
+    categories: Optional[List[str]] = None
+
+
+@dataclass
+class ScrapeResult:
+    rows: List[Opportunity]
+    path_used: str
+    attempted_paths: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class RunSummary:
+    ok: bool
+    total_scraped: int = 0
+    total_parsed: int = 0
+    scrape_path: str = "none"
+    created: int = 0
+    updated: int = 0
+    skipped: int = 0
+    categories_written: bool = True
+    started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    finished_at: str = ""
+    warnings: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+
+    def finish(self) -> Dict[str, object]:
+        self.finished_at = datetime.now(timezone.utc).isoformat()
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class AirtableConfig:
+    base_id: str
+    opportunities_table: str
+    firms_table: str = ""
+    notifications_table: str = ""
+
+    @classmethod
+    def from_env(cls) -> "AirtableConfig":
+        return cls(
+            base_id=os.getenv("AIRTABLE_BASE_ID", "appkRSDtaZ5dzchnZ"),
+            opportunities_table=os.getenv("AIRTABLE_TABLE_ID") or os.getenv("AIRTABLE_TABLE_NAME", "Opportunities"),
+            firms_table=os.getenv("AIRTABLE_FIRMS_TABLE_ID", "tbl63Qw3qlmUv9wFg"),
+            notifications_table=os.getenv("AIRTABLE_NOTIFICATIONS_TABLE_ID", "tblL1dUryHbiuV3t7"),
+        )
+
+
+def configure_logging(level: str | None = None) -> None:
+    logging.basicConfig(
+        level=getattr(logging, (level or os.getenv("LOG_LEVEL", "INFO")).upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
+
+def normalize_text(text: object) -> str:
+    if text is None:
+        return ""
+    stripped = re.sub(r"[`*_#|]+", " ", str(text))
+    stripped = stripped.replace("\xa0", " ")
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
+def parse_date_iso(value: str) -> Optional[str]:
+    value = normalize_text(value)
+    if not value or value.lower() in {"deferred", "pending", "pending award", "tbd", "n/a", "na", "-"}:
+        return None
+
+    try:
+        from dateutil import parser as date_parser
+
+        return date_parser.parse(value, fuzzy=True).date().isoformat()
+    except Exception:
+        logger.info("Skipping non-parseable date value: %s", value)
+        return None
+
+
+def _date_or_text(value: str) -> str:
+    return parse_date_iso(value) or normalize_text(value)
+
+
+def categorize(opportunity: Opportunity) -> List[str]:
+    haystack = f"{opportunity.scope_description} {opportunity.phase}".lower()
+    matches: List[str] = []
+
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if any(keyword in haystack for keyword in keywords):
+            matches.append(category)
+
+    if not matches:
+        logger.info("No category keywords matched for scope %s; assigning Other", opportunity.scope_number)
+    return matches or ["Other"]
+
+
+def canonical_header(text: object) -> str:
+    header = normalize_text(text).lower()
+    header = re.sub(r"\s*/\s*", "/", header)
+    return header
+
+
+def _header_index(headers: Sequence[str]) -> Dict[str, int]:
+    normalized = [canonical_header(header) for header in headers]
+    index: Dict[str, int] = {}
+    for field_name, aliases in HEADER_ALIASES.items():
+        canonical_aliases = [canonical_header(alias) for alias in aliases]
+        for position, header in enumerate(normalized):
+            if header in canonical_aliases:
+                index[field_name] = position
+                break
+    return index
+
+
+def _get_cell(cells: Sequence[str], index: Dict[str, int], field_name: str) -> str:
+    position = index.get(field_name)
+    if position is None or position >= len(cells):
+        return ""
+    return normalize_text(cells[position])
+
+
+def _opportunity_from_cells(cells: Sequence[str], index: Dict[str, int]) -> Optional[Opportunity]:
+    scope_number = _get_cell(cells, index, "scope_number")
+    if not scope_number:
+        logger.debug("Skipping malformed row without Scope Number: %s", cells)
+        return None
+
+    return Opportunity(
+        scope_number=scope_number,
+        phase=_get_cell(cells, index, "phase"),
+        scope_description=_get_cell(cells, index, "scope_description"),
+        price_range=_get_cell(cells, index, "price_range"),
+        scope_status=_get_cell(cells, index, "scope_status"),
+        release_for_bid=_get_cell(cells, index, "release_for_bid"),
+        quotes_due=_get_cell(cells, index, "quotes_due"),
+    )
+
+
+def parse_markdown_table(md: str) -> List[Opportunity]:
+    rows: List[Opportunity] = []
+    lines = [line.strip() for line in md.splitlines() if line.strip().startswith("|")]
+
+    i = 0
+    while i < len(lines) - 1:
+        headers = [normalize_text(cell) for cell in lines[i].strip("|").split("|")]
+        index = _header_index(headers)
+        separator_candidate = lines[i + 1]
+        is_separator = bool(re.match(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?$", separator_candidate))
+
+        if "scope_number" not in index or not is_separator:
+            i += 1
+            continue
+
+        i += 2
+        while i < len(lines):
+            cells = [normalize_text(cell) for cell in lines[i].strip("|").split("|")]
+            if len(cells) < 2:
+                i += 1
+                continue
+            opportunity = _opportunity_from_cells(cells, index)
+            if opportunity:
+                rows.append(opportunity)
+            i += 1
+        break
+
+    logger.info("Parsed %s opportunities from markdown", len(rows))
+    return rows
+
+
+class TableHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: List[List[List[str]]] = []
+        self._current_table: Optional[List[List[str]]] = None
+        self._current_row: Optional[List[str]] = None
+        self._current_cell: Optional[List[str]] = None
+        self._in_cell = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "table":
+            self._current_table = []
+        elif tag == "tr" and self._current_table is not None:
+            self._current_row = []
+        elif tag in {"th", "td"} and self._current_row is not None:
+            self._current_cell = []
+            self._in_cell = True
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell and self._current_cell is not None:
+            self._current_cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"th", "td"} and self._current_row is not None and self._current_cell is not None:
+            self._current_row.append(normalize_text(" ".join(self._current_cell)))
+            self._current_cell = None
+            self._in_cell = False
+        elif tag == "tr" and self._current_table is not None and self._current_row is not None:
+            if any(cell for cell in self._current_row):
+                self._current_table.append(self._current_row)
+            self._current_row = None
+        elif tag == "table" and self._current_table is not None:
+            self.tables.append(self._current_table)
+            self._current_table = None
+
+
+def parse_html_table(html: str) -> List[Opportunity]:
+    parser = TableHTMLParser()
+    parser.feed(html or "")
+    rows: List[Opportunity] = []
+
+    for table in parser.tables:
+        if not table:
+            continue
+        index = _header_index(table[0])
+        if "scope_number" not in index:
+            continue
+        for cells in table[1:]:
+            opportunity = _opportunity_from_cells(cells, index)
+            if opportunity:
+                rows.append(opportunity)
+        if rows:
+            break
+
+    logger.info("Parsed %s opportunities from HTML", len(rows))
+    return rows
+
+
+def _requests_session():
+    import requests
+
+    return requests.Session()
+
+
+def scrape_firecrawl(api_key: str, url: str = SOURCE_URL) -> List[Opportunity]:
+    session = _requests_session()
+    response = session.post(
+        FIRECRAWL_SCRAPE_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"url": url, "formats": ["markdown", "html"]},
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json().get("data", {})
+    rows = parse_markdown_table(payload.get("markdown") or "")
+    if not rows and payload.get("html"):
+        logger.warning("Firecrawl markdown parse produced 0 rows; trying Firecrawl HTML payload")
+        rows = parse_html_table(payload.get("html") or "")
+    return rows
+
+
+def scrape_direct(url: str = SOURCE_URL) -> List[Opportunity]:
+    session = _requests_session()
+    response = session.get(url, timeout=60, headers={"User-Agent": "BBB-BRIDGE-CRM/1.0"})
+    response.raise_for_status()
+    return parse_html_table(response.text)
+
+
+def scrape_opportunities(url: str = SOURCE_URL, firecrawl_key: str | None = None) -> ScrapeResult:
+    errors: List[str] = []
+    attempted_paths: List[str] = []
+
+    if firecrawl_key:
+        attempted_paths.append("firecrawl")
+        try:
+            rows = scrape_firecrawl(firecrawl_key, url)
+            if rows:
+                logger.info("Scrape succeeded via Firecrawl with %s rows", len(rows))
+                return ScrapeResult(rows=rows, path_used="firecrawl", attempted_paths=attempted_paths, errors=errors)
+            errors.append("Firecrawl returned 0 parsed rows")
+            logger.warning("Firecrawl returned 0 parsed rows; falling back to direct HTML")
+        except Exception as exc:
+            errors.append(f"Firecrawl failed: {exc}")
+            logger.exception("Firecrawl scrape failed; falling back to direct HTML")
+
+    attempted_paths.append("direct_html")
+    try:
+        rows = scrape_direct(url)
+        if rows:
+            logger.info("Scrape succeeded via direct HTML with %s rows", len(rows))
+            return ScrapeResult(rows=rows, path_used="direct_html", attempted_paths=attempted_paths, errors=errors)
+        errors.append("Direct HTML returned 0 parsed rows")
+        logger.error("Direct HTML returned 0 parsed rows")
+    except Exception as exc:
+        errors.append(f"Direct HTML failed: {exc}")
+        logger.exception("Direct HTML scrape failed")
+
+    return ScrapeResult(rows=[], path_used="none", attempted_paths=attempted_paths, errors=errors)
+
+
+class AirtableClient:
+    def __init__(self, api_key: str, base_id: str, table_name_or_id: str, max_retries: int = 3) -> None:
+        safe_table = quote(table_name_or_id, safe="")
+        self.base_url = f"{AIRTABLE_API_ROOT}/{base_id}/{safe_table}"
+        self.session = _requests_session()
+        self.session.headers.update({"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        self.max_retries = max_retries
+
+    def _request_with_retry(self, method: str, url: str, **kwargs):
+        last_response = None
+        for attempt in range(self.max_retries + 1):
+            response = self.session.request(method, url, timeout=30, **kwargs)
+            last_response = response
+            if response.status_code not in TRANSIENT_STATUS_CODES:
+                response.raise_for_status()
+                return response
+
+            sleep_for = int(response.headers.get("Retry-After", "0")) or min(2**attempt, 8)
+            logger.warning(
+                "Transient Airtable failure status=%s attempt=%s/%s retry_in=%ss body=%s",
+                response.status_code,
+                attempt + 1,
+                self.max_retries + 1,
+                sleep_for,
+                response.text[:500],
+            )
+            if attempt < self.max_retries:
+                time.sleep(sleep_for)
+
+        assert last_response is not None
+        last_response.raise_for_status()
+        return last_response
+
+    def upsert_batch(self, records: List[Dict[str, object]], merge_field: str = "Scope Number") -> Dict[str, int]:
+        created = 0
+        updated = 0
+        for i in range(0, len(records), AIRTABLE_BATCH_SIZE):
+            chunk = records[i : i + AIRTABLE_BATCH_SIZE]
+            payload = {
+                "performUpsert": {"fieldsToMergeOn": [merge_field]},
+                "records": [{"fields": record} for record in chunk],
+                "typecast": True,
+            }
+            try:
+                response = self._request_with_retry("PATCH", self.base_url, json=payload)
+                body = response.json()
+                created_records = body.get("createdRecords", [])
+                created += len(created_records)
+                updated += max(0, len(chunk) - len(created_records))
+                logger.info("Airtable upsert chunk complete created=%s updated=%s", len(created_records), max(0, len(chunk) - len(created_records)))
+            except Exception:
+                logger.exception("Airtable upsert chunk failed for %s records", len(chunk))
+                raise
+        return {"created": created, "updated": updated}
+
+
+def build_airtable_fields(opp: Opportunity, include_categories: bool = True, include_unparseable_dates: bool = False) -> Dict[str, object]:
+    fields: Dict[str, object] = {
+        "Scope Number": opp.scope_number,
+        "Phase": opp.phase,
+        "Scope Description": opp.scope_description,
+        "Price Range": opp.price_range,
+        "Scope Status": opp.scope_status,
+        "Source URL": opp.source_url,
+        "Last Scraped": datetime.now(timezone.utc).isoformat(),
+    }
+
+    for airtable_field, raw_value in (
+        ("Release for Bid", opp.release_for_bid),
+        ("Deadline/Quotes Due", opp.quotes_due),
+    ):
+        parsed_date = parse_date_iso(raw_value)
+        if parsed_date:
+            fields[airtable_field] = parsed_date
+        elif include_unparseable_dates and normalize_text(raw_value):
+            fields[airtable_field] = normalize_text(raw_value)
+        else:
+            logger.info("Skipping %s for scope %s because value is not an ISO-parseable date", airtable_field, opp.scope_number)
+
+    if include_categories:
+        fields["Categories"] = opp.categories or ["Other"]
+    if opp.scope_number and opp.scope_description:
+        fields["Bid Title"] = f"{opp.scope_number} — {opp.scope_description[:80]}"
+    return fields
+
+
+def airtable_error_text(exc: Exception) -> str:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return str(exc)
+    return getattr(response, "text", "") or str(exc)
+
+
+def _airtable_upsert_with_field_fallback(client: AirtableClient, rows: List[Opportunity]) -> Tuple[Dict[str, int], bool]:
+    try:
+        return client.upsert_batch([build_airtable_fields(opp, include_categories=True) for opp in rows]), True
+    except Exception as exc:
+        message = airtable_error_text(exc)
+        if "Unknown field name: \"Categories\"" not in message and "UNKNOWN_FIELD_NAME" not in message:
+            raise
+        logger.warning("Airtable Categories field is unavailable; retrying upsert without Categories")
+        return client.upsert_batch([build_airtable_fields(opp, include_categories=False) for opp in rows]), False
+
+
+def _record_run_summary(summary: RunSummary) -> Dict[str, object]:
+    global LAST_RUN_SUMMARY
+
+    result = summary.finish()
+    LAST_RUN_SUMMARY = result
+    return result
+
+
+def run_once() -> Dict[str, object]:
+    summary = RunSummary(ok=False)
+    airtable_key = os.getenv("AIRTABLE_API_KEY", "")
+    firecrawl_key = os.getenv("FIRECRAWL_API_KEY", "")
+    config = AirtableConfig.from_env()
+
+    if not airtable_key:
+        summary.errors.append("AIRTABLE_API_KEY is required")
+        logger.error("AIRTABLE_API_KEY is required")
+        return _record_run_summary(summary)
+
+    scrape = scrape_opportunities(firecrawl_key=firecrawl_key)
+    summary.scrape_path = scrape.path_used
+    summary.errors.extend(scrape.errors)
+    summary.total_scraped = len(scrape.rows)
+    if scrape.errors:
+        summary.warnings.extend(scrape.errors)
+    if not scrape.rows:
+        summary.errors.append("Scrape returned 0 rows")
+        logger.error("Run failed because scraper produced 0 rows. attempted_paths=%s errors=%s", scrape.attempted_paths, scrape.errors)
+        return _record_run_summary(summary)
+
+    seen_scope_numbers = set()
+    rows: List[Opportunity] = []
+    for opp in scrape.rows:
+        if not opp.scope_number:
+            summary.skipped += 1
+            warning = "Skipped parsed opportunity without Scope Number"
+            summary.warnings.append(warning)
+            logger.warning("%s: %s", warning, opp)
+            continue
+        if opp.scope_number in seen_scope_numbers:
+            summary.skipped += 1
+            warning = f"Skipped duplicate scraped Scope Number: {opp.scope_number}"
+            summary.warnings.append(warning)
+            logger.warning(warning)
+            continue
+        seen_scope_numbers.add(opp.scope_number)
+        opp.categories = categorize(opp)
+        rows.append(opp)
+
+    summary.total_parsed = len(rows)
+    if not rows:
+        summary.errors.append("All parsed rows were malformed or duplicate")
+        logger.error("All parsed rows were malformed or duplicate")
+        return _record_run_summary(summary)
+
+    client = AirtableClient(airtable_key, config.base_id, config.opportunities_table)
+    try:
+        result, categories_written = _airtable_upsert_with_field_fallback(client, rows)
+    except Exception as exc:
+        summary.errors.append(f"Airtable upsert failed: {airtable_error_text(exc)}")
+        logger.exception("Airtable upsert failed")
+        return _record_run_summary(summary)
+
+    summary.created = int(result.get("created", 0))
+    summary.updated = int(result.get("updated", 0))
+    summary.categories_written = categories_written
+    if not categories_written:
+        summary.warnings.append("Categories field was not written because Airtable rejected or does not have that field")
+    summary.ok = True
+    logger.info(
+        "Run complete path=%s total_scraped=%s total_parsed=%s skipped=%s created=%s updated=%s categories_written=%s",
+        summary.scrape_path,
+        summary.total_scraped,
+        summary.total_parsed,
+        summary.skipped,
+        summary.created,
+        summary.updated,
+        summary.categories_written,
+    )
+    return _record_run_summary(summary)
+
+
+def ensure_db(path: Path = DEFAULT_DB_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS firms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_name TEXT NOT NULL,
+            contact_name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            phone TEXT,
+            capabilities TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            firm_id INTEGER NOT NULL,
+            scope_number TEXT NOT NULL,
+            categories TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            UNIQUE(firm_id, scope_number),
+            FOREIGN KEY(firm_id) REFERENCES firms(id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def match_firms_to_opportunities(path: Path = DEFAULT_DB_PATH) -> int:
+    scrape = scrape_opportunities(firecrawl_key=os.getenv("FIRECRAWL_API_KEY", ""))
+    if not scrape.rows:
+        logger.error("Firm matching skipped because scraper returned 0 rows: %s", scrape.errors)
+        return 0
+    for opp in scrape.rows:
+        opp.categories = categorize(opp)
+
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    cur.execute("SELECT id, capabilities FROM firms")
+    firms = cur.fetchall()
+    new_matches = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    for firm_id, capabilities in firms:
+        cap_tokens = [normalize_text(item).lower() for item in capabilities.split(",") if normalize_text(item)]
+        for opp in scrape.rows:
+            opportunity_categories = " ".join(opp.categories or []).lower()
+            if not opp.scope_number or not any(token in opportunity_categories for token in cap_tokens):
+                continue
+            try:
+                cur.execute(
+                    "INSERT INTO matches (firm_id, scope_number, categories, created_at) VALUES (?, ?, ?, ?)",
+                    (firm_id, opp.scope_number, ", ".join(opp.categories or ["Other"]), now),
+                )
+                new_matches += 1
+            except sqlite3.IntegrityError:
+                logger.debug("Local duplicate match skipped firm_id=%s scope=%s", firm_id, opp.scope_number)
+
+    conn.commit()
+    conn.close()
+    logger.info("Local matching complete new_matches=%s", new_matches)
+    return new_matches
+
+
+def airtable_config_status() -> Dict[str, object]:
+    config = AirtableConfig.from_env()
+    return {
+        "base_configured": bool(config.base_id),
+        "base_id": config.base_id,
+        "opportunities_table_configured": bool(config.opportunities_table),
+        "opportunities_table": config.opportunities_table,
+        "firms_table_configured": bool(config.firms_table),
+        "notifications_table_configured": bool(config.notifications_table),
+        "api_key_configured": bool(os.getenv("AIRTABLE_API_KEY")),
+        "firecrawl_configured": bool(os.getenv("FIRECRAWL_API_KEY")),
+    }
+
+
+def scheduler_config() -> Dict[str, object]:
+    return {"timezone": SCHEDULER_TIMEZONE, "hour": SCHEDULER_HOUR, "minute": SCHEDULER_MINUTE}
+
+
+def health_payload() -> Dict[str, object]:
+    return {
+        "ok": True,
+        "service": "bbb-bridge-crm",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scheduler": scheduler_config(),
+        "airtable": airtable_config_status(),
+    }
+
+
+def create_app(db_path: Path = DEFAULT_DB_PATH):
+    from flask import Flask, jsonify, redirect, render_template_string
+
+    ensure_db(db_path)
+    app = Flask(__name__)
+
+    @app.get("/")
+    def home():
+        return redirect("/admin")
+
+    @app.get("/admin")
+    def admin_dashboard():
+        health = health_payload()
+        last_run = LAST_RUN_SUMMARY
+        return render_template_string(
+            """
+            <!doctype html>
+            <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>BBB BRIDGE CRM Admin</title>
+              <style>
+                :root { color-scheme: light; font-family: Arial, sans-serif; }
+                body { margin: 0; background: #f6f7fb; color: #172033; }
+                header { background: #2b2118; color: #fff; padding: 1.25rem 2rem; }
+                main { max-width: 1100px; margin: 0 auto; padding: 1.5rem; }
+                .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+                .card { background: #fff; border: 1px solid #dde2ec; border-radius: 12px; padding: 1rem; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+                .metric { font-size: 2rem; font-weight: 700; margin: .25rem 0; }
+                .ok { color: #0f7b3f; font-weight: 700; }
+                .warn { color: #9f5f00; font-weight: 700; }
+                .bad { color: #b42318; font-weight: 700; }
+                button { background: #5b3b22; border: 0; color: #fff; padding: .7rem 1rem; border-radius: 8px; cursor: pointer; }
+                button[disabled] { background: #a7a7a7; cursor: not-allowed; }
+                pre { background: #101828; color: #eef4ff; padding: 1rem; border-radius: 10px; overflow-x: auto; }
+                ul { padding-left: 1.25rem; }
+                .actions { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
+              </style>
+            </head>
+            <body>
+              <header>
+                <h1>Be Brown Brave BRIDGE CRM Admin</h1>
+                <p>Internal automation monitor. Airtable remains the CRM source of truth.</p>
+              </header>
+              <main>
+                <section class="grid">
+                  <div class="card">
+                    <h2>Backend Health</h2>
+                    <p class="{{ 'ok' if health.ok else 'bad' }}">{{ 'Healthy' if health.ok else 'Unhealthy' }}</p>
+                    <p>Timestamp: {{ health.timestamp }}</p>
+                  </div>
+                  <div class="card">
+                    <h2>Scheduler</h2>
+                    <p>{{ health.scheduler.hour }}:{{ '%02d'|format(health.scheduler.minute) }} {{ health.scheduler.timezone }}</p>
+                  </div>
+                  <div class="card">
+                    <h2>Airtable Config</h2>
+                    <p>Base: <span class="{{ 'ok' if health.airtable.base_configured else 'bad' }}">{{ 'configured' if health.airtable.base_configured else 'missing' }}</span></p>
+                    <p>Opportunities table: <span class="{{ 'ok' if health.airtable.opportunities_table_configured else 'bad' }}">{{ health.airtable.opportunities_table or 'missing' }}</span></p>
+                    <p>API key: <span class="{{ 'ok' if health.airtable.api_key_configured else 'bad' }}">{{ 'configured' if health.airtable.api_key_configured else 'missing' }}</span></p>
+                    <p>Firecrawl: <span class="{{ 'ok' if health.airtable.firecrawl_configured else 'warn' }}">{{ 'configured' if health.airtable.firecrawl_configured else 'not configured; direct HTML fallback will be used' }}</span></p>
+                  </div>
+                </section>
+
+                <section class="card" style="margin-top: 1rem;">
+                  <h2>Actions</h2>
+                  <div class="actions">
+                    <button id="run-scraper">Run Opportunity Scraper Now</button>
+                    <button disabled title="Future phase: matching orchestration will be enabled after admin auth and notification routing are designed.">Run Matching Now (coming later)</button>
+                  </div>
+                  <p id="run-status" class="warn"></p>
+                </section>
+
+                <section class="grid" style="margin-top: 1rem;">
+                  <div class="card"><h3>Scrape Path</h3><div class="metric">{{ last_run.scrape_path if last_run else '—' }}</div></div>
+                  <div class="card"><h3>Total Scraped</h3><div class="metric">{{ last_run.total_scraped if last_run else '—' }}</div></div>
+                  <div class="card"><h3>Created</h3><div class="metric">{{ last_run.created if last_run else '—' }}</div></div>
+                  <div class="card"><h3>Updated</h3><div class="metric">{{ last_run.updated if last_run else '—' }}</div></div>
+                  <div class="card"><h3>Skipped</h3><div class="metric">{{ last_run.skipped if last_run else '—' }}</div></div>
+                </section>
+
+                <section class="card" style="margin-top: 1rem;">
+                  <h2>Last Run Summary</h2>
+                  {% if last_run %}
+                    <p>Status: <span class="{{ 'ok' if last_run.ok else 'bad' }}">{{ 'success' if last_run.ok else 'failed' }}</span></p>
+                    <p>Started: {{ last_run.started_at }} | Finished: {{ last_run.finished_at }}</p>
+                    <p>Categories written: {{ last_run.categories_written }}</p>
+                    <h3>Warnings</h3>
+                    {% if last_run.warnings %}<ul>{% for warning in last_run.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>{% else %}<p>None</p>{% endif %}
+                    <h3>Errors</h3>
+                    {% if last_run.errors %}<ul>{% for error in last_run.errors %}<li>{{ error }}</li>{% endfor %}</ul>{% else %}<p>None</p>{% endif %}
+                    <details><summary>Raw JSON</summary><pre>{{ last_run_json }}</pre></details>
+                  {% else %}
+                    <p>No run has been triggered in this server process yet. Use the button above or call <code>POST /run</code>.</p>
+                  {% endif %}
+                </section>
+              </main>
+              <script>
+                document.getElementById('run-scraper').addEventListener('click', async () => {
+                  const status = document.getElementById('run-status');
+                  const button = document.getElementById('run-scraper');
+                  button.disabled = true;
+                  status.textContent = 'Running scraper...';
+                  try {
+                    const response = await fetch('/run', { method: 'POST' });
+                    const payload = await response.json();
+                    status.textContent = payload.ok ? 'Run finished. Refreshing dashboard...' : 'Run failed. Refreshing dashboard...';
+                    setTimeout(() => window.location.reload(), 900);
+                  } catch (error) {
+                    status.textContent = `Run request failed: ${error}`;
+                    button.disabled = false;
+                  }
+                });
+              </script>
+            </body>
+            </html>
+            """,
+            health=health,
+            last_run=last_run,
+            last_run_json=json.dumps(last_run, indent=2, sort_keys=True) if last_run else "{}",
+        )
+
+    @app.get("/health")
+    def health():
+        return jsonify(health_payload())
+
+    @app.post("/run")
+    def trigger():
+        scrape_result = run_once()
+        status = 200 if scrape_result.get("ok") else 500
+        return jsonify({"ok": bool(scrape_result.get("ok")), "scrape": scrape_result}), status
+
+    return app
+
+
+def serve_dashboard(host: str = "0.0.0.0", port: int = 8787) -> None:
+    create_app().run(host=host, port=port)
+
+
+def run_scheduler() -> None:
+    from apscheduler.schedulers.blocking import BlockingScheduler
+    from zoneinfo import ZoneInfo
+
+    scheduler = BlockingScheduler(timezone=ZoneInfo(SCHEDULER_TIMEZONE))
+    scheduler.add_job(run_once, "cron", hour=SCHEDULER_HOUR, minute=SCHEDULER_MINUTE, id="walsh_kokosing_daily")
+    logger.info("Scheduler started: daily at %02d:%02d %s", SCHEDULER_HOUR, SCHEDULER_MINUTE, SCHEDULER_TIMEZONE)
+    scheduler.start()
+
+
+def main() -> None:
+    configure_logging()
+    parser = argparse.ArgumentParser(description="Be Brown Brave BRIDGE CRM backend")
+    parser.add_argument("--once", action="store_true", help="Run one opportunity sync immediately")
+    parser.add_argument("--schedule", action="store_true", help="Run 2:00 AM ET daily scheduler")
+    parser.add_argument("--serve", action="store_true", help="Start internal admin web app")
+    parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"), help="Web server host")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8787")), help="Web server port")
+    args = parser.parse_args()
+
+    if args.once:
+        print(json.dumps(run_once(), indent=2))
+    if args.schedule:
+        run_scheduler()
+    if args.serve:
+        serve_dashboard(host=args.host, port=args.port)
+    if not (args.once or args.schedule or args.serve):
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
