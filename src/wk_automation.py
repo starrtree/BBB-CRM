@@ -25,6 +25,7 @@ SCHEDULER_MINUTE = 0
 TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 logger = logging.getLogger("bbb_bridge_crm")
+LAST_RUN_SUMMARY: Optional[Dict[str, object]] = None
 
 CATEGORY_KEYWORDS: Dict[str, List[str]] = {
     "Concrete": ["concrete", "curb", "sidewalk", "slab", "rebar"],
@@ -75,13 +76,16 @@ class ScrapeResult:
 @dataclass
 class RunSummary:
     ok: bool
+    total_scraped: int = 0
     total_parsed: int = 0
     scrape_path: str = "none"
     created: int = 0
     updated: int = 0
+    skipped: int = 0
     categories_written: bool = True
     started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     finished_at: str = ""
+    warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
     def finish(self) -> Dict[str, object]:
@@ -449,6 +453,14 @@ def _airtable_upsert_with_field_fallback(client: AirtableClient, rows: List[Oppo
         return client.upsert_batch([build_airtable_fields(opp, include_categories=False) for opp in rows]), False
 
 
+def _record_run_summary(summary: RunSummary) -> Dict[str, object]:
+    global LAST_RUN_SUMMARY
+
+    result = summary.finish()
+    LAST_RUN_SUMMARY = result
+    return result
+
+
 def run_once() -> Dict[str, object]:
     summary = RunSummary(ok=False)
     airtable_key = os.getenv("AIRTABLE_API_KEY", "")
@@ -458,24 +470,33 @@ def run_once() -> Dict[str, object]:
     if not airtable_key:
         summary.errors.append("AIRTABLE_API_KEY is required")
         logger.error("AIRTABLE_API_KEY is required")
-        return summary.finish()
+        return _record_run_summary(summary)
 
     scrape = scrape_opportunities(firecrawl_key=firecrawl_key)
     summary.scrape_path = scrape.path_used
     summary.errors.extend(scrape.errors)
+    summary.total_scraped = len(scrape.rows)
+    if scrape.errors:
+        summary.warnings.extend(scrape.errors)
     if not scrape.rows:
         summary.errors.append("Scrape returned 0 rows")
         logger.error("Run failed because scraper produced 0 rows. attempted_paths=%s errors=%s", scrape.attempted_paths, scrape.errors)
-        return summary.finish()
+        return _record_run_summary(summary)
 
     seen_scope_numbers = set()
     rows: List[Opportunity] = []
     for opp in scrape.rows:
         if not opp.scope_number:
-            logger.warning("Skipping parsed opportunity without Scope Number: %s", opp)
+            summary.skipped += 1
+            warning = "Skipped parsed opportunity without Scope Number"
+            summary.warnings.append(warning)
+            logger.warning("%s: %s", warning, opp)
             continue
         if opp.scope_number in seen_scope_numbers:
-            logger.warning("Skipping duplicate scraped Scope Number before Airtable upsert: %s", opp.scope_number)
+            summary.skipped += 1
+            warning = f"Skipped duplicate scraped Scope Number: {opp.scope_number}"
+            summary.warnings.append(warning)
+            logger.warning(warning)
             continue
         seen_scope_numbers.add(opp.scope_number)
         opp.categories = categorize(opp)
@@ -485,7 +506,7 @@ def run_once() -> Dict[str, object]:
     if not rows:
         summary.errors.append("All parsed rows were malformed or duplicate")
         logger.error("All parsed rows were malformed or duplicate")
-        return summary.finish()
+        return _record_run_summary(summary)
 
     client = AirtableClient(airtable_key, config.base_id, config.opportunities_table)
     try:
@@ -493,21 +514,25 @@ def run_once() -> Dict[str, object]:
     except Exception as exc:
         summary.errors.append(f"Airtable upsert failed: {airtable_error_text(exc)}")
         logger.exception("Airtable upsert failed")
-        return summary.finish()
+        return _record_run_summary(summary)
 
     summary.created = int(result.get("created", 0))
     summary.updated = int(result.get("updated", 0))
     summary.categories_written = categories_written
+    if not categories_written:
+        summary.warnings.append("Categories field was not written because Airtable rejected or does not have that field")
     summary.ok = True
     logger.info(
-        "Run complete path=%s total=%s created=%s updated=%s categories_written=%s",
+        "Run complete path=%s total_scraped=%s total_parsed=%s skipped=%s created=%s updated=%s categories_written=%s",
         summary.scrape_path,
+        summary.total_scraped,
         summary.total_parsed,
+        summary.skipped,
         summary.created,
         summary.updated,
         summary.categories_written,
     )
-    return summary.finish()
+    return _record_run_summary(summary)
 
 
 def ensure_db(path: Path = DEFAULT_DB_PATH) -> None:
@@ -581,129 +606,166 @@ def match_firms_to_opportunities(path: Path = DEFAULT_DB_PATH) -> int:
     return new_matches
 
 
+def airtable_config_status() -> Dict[str, object]:
+    config = AirtableConfig.from_env()
+    return {
+        "base_configured": bool(config.base_id),
+        "base_id": config.base_id,
+        "opportunities_table_configured": bool(config.opportunities_table),
+        "opportunities_table": config.opportunities_table,
+        "firms_table_configured": bool(config.firms_table),
+        "notifications_table_configured": bool(config.notifications_table),
+        "api_key_configured": bool(os.getenv("AIRTABLE_API_KEY")),
+        "firecrawl_configured": bool(os.getenv("FIRECRAWL_API_KEY")),
+    }
+
+
+def scheduler_config() -> Dict[str, object]:
+    return {"timezone": SCHEDULER_TIMEZONE, "hour": SCHEDULER_HOUR, "minute": SCHEDULER_MINUTE}
+
+
+def health_payload() -> Dict[str, object]:
+    return {
+        "ok": True,
+        "service": "bbb-bridge-crm",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scheduler": scheduler_config(),
+        "airtable": airtable_config_status(),
+    }
+
+
 def create_app(db_path: Path = DEFAULT_DB_PATH):
-    from flask import Flask, jsonify, redirect, render_template_string, request, url_for
+    from flask import Flask, jsonify, redirect, render_template_string
 
     ensure_db(db_path)
     app = Flask(__name__)
 
     @app.get("/")
     def home():
+        return redirect("/admin")
+
+    @app.get("/admin")
+    def admin_dashboard():
+        health = health_payload()
+        last_run = LAST_RUN_SUMMARY
         return render_template_string(
             """
-            <h1>Be Brown Brave BRIDGE CRM</h1>
-            <p>Submit your firm profile for automated Walsh Kokosing opportunity matching.</p>
-            <a href='{{ url_for("intake") }}'>Firm Intake Form</a> |
-            <a href='{{ url_for("portal") }}'>Firm Portal</a>
-            """
-        )
+            <!doctype html>
+            <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>BBB BRIDGE CRM Admin</title>
+              <style>
+                :root { color-scheme: light; font-family: Arial, sans-serif; }
+                body { margin: 0; background: #f6f7fb; color: #172033; }
+                header { background: #2b2118; color: #fff; padding: 1.25rem 2rem; }
+                main { max-width: 1100px; margin: 0 auto; padding: 1.5rem; }
+                .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+                .card { background: #fff; border: 1px solid #dde2ec; border-radius: 12px; padding: 1rem; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+                .metric { font-size: 2rem; font-weight: 700; margin: .25rem 0; }
+                .ok { color: #0f7b3f; font-weight: 700; }
+                .warn { color: #9f5f00; font-weight: 700; }
+                .bad { color: #b42318; font-weight: 700; }
+                button { background: #5b3b22; border: 0; color: #fff; padding: .7rem 1rem; border-radius: 8px; cursor: pointer; }
+                button[disabled] { background: #a7a7a7; cursor: not-allowed; }
+                pre { background: #101828; color: #eef4ff; padding: 1rem; border-radius: 10px; overflow-x: auto; }
+                ul { padding-left: 1.25rem; }
+                .actions { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
+              </style>
+            </head>
+            <body>
+              <header>
+                <h1>Be Brown Brave BRIDGE CRM Admin</h1>
+                <p>Internal automation monitor. Airtable remains the CRM source of truth.</p>
+              </header>
+              <main>
+                <section class="grid">
+                  <div class="card">
+                    <h2>Backend Health</h2>
+                    <p class="{{ 'ok' if health.ok else 'bad' }}">{{ 'Healthy' if health.ok else 'Unhealthy' }}</p>
+                    <p>Timestamp: {{ health.timestamp }}</p>
+                  </div>
+                  <div class="card">
+                    <h2>Scheduler</h2>
+                    <p>{{ health.scheduler.hour }}:{{ '%02d'|format(health.scheduler.minute) }} {{ health.scheduler.timezone }}</p>
+                  </div>
+                  <div class="card">
+                    <h2>Airtable Config</h2>
+                    <p>Base: <span class="{{ 'ok' if health.airtable.base_configured else 'bad' }}">{{ 'configured' if health.airtable.base_configured else 'missing' }}</span></p>
+                    <p>Opportunities table: <span class="{{ 'ok' if health.airtable.opportunities_table_configured else 'bad' }}">{{ health.airtable.opportunities_table or 'missing' }}</span></p>
+                    <p>API key: <span class="{{ 'ok' if health.airtable.api_key_configured else 'bad' }}">{{ 'configured' if health.airtable.api_key_configured else 'missing' }}</span></p>
+                    <p>Firecrawl: <span class="{{ 'ok' if health.airtable.firecrawl_configured else 'warn' }}">{{ 'configured' if health.airtable.firecrawl_configured else 'not configured; direct HTML fallback will be used' }}</span></p>
+                  </div>
+                </section>
 
-    @app.route("/intake", methods=["GET", "POST"])
-    def intake():
-        if request.method == "POST":
-            company = normalize_text(request.form.get("company_name", ""))
-            contact = normalize_text(request.form.get("contact_name", ""))
-            email = normalize_text(request.form.get("email", "")).lower()
-            phone = normalize_text(request.form.get("phone", ""))
-            capabilities = normalize_text(request.form.get("capabilities", ""))
-            if not (company and contact and email and capabilities):
-                return jsonify({"ok": False, "error": "company_name, contact_name, email, and capabilities are required"}), 400
-            conn = sqlite3.connect(db_path)
-            conn.execute(
-                "INSERT INTO firms (company_name, contact_name, email, phone, capabilities, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (company, contact, email, phone, capabilities, datetime.now(timezone.utc).isoformat()),
-            )
-            conn.commit()
-            conn.close()
-            new_matches = match_firms_to_opportunities(db_path)
-            logger.info("Firm intake saved email=%s new_matches=%s", email, new_matches)
-            return redirect(url_for("portal", email=email))
+                <section class="card" style="margin-top: 1rem;">
+                  <h2>Actions</h2>
+                  <div class="actions">
+                    <button id="run-scraper">Run Opportunity Scraper Now</button>
+                    <button disabled title="Future phase: matching orchestration will be enabled after admin auth and notification routing are designed.">Run Matching Now (coming later)</button>
+                  </div>
+                  <p id="run-status" class="warn"></p>
+                </section>
 
-        categories = sorted(CATEGORY_KEYWORDS.keys())
-        return render_template_string(
-            """
-            <h2>Firm Intake</h2>
-            <p>Use comma-separated capabilities. Examples: {{ categories|join(', ') }}</p>
-            <form method="post">
-              <label>Company Name <input name="company_name" required></label><br/>
-              <label>Contact Name <input name="contact_name" required></label><br/>
-              <label>Email <input name="email" type="email" required></label><br/>
-              <label>Phone <input name="phone"></label><br/>
-              <label>Capabilities<br/><textarea name="capabilities" required></textarea></label><br/>
-              <button type="submit">Submit</button>
-            </form>
+                <section class="grid" style="margin-top: 1rem;">
+                  <div class="card"><h3>Scrape Path</h3><div class="metric">{{ last_run.scrape_path if last_run else '—' }}</div></div>
+                  <div class="card"><h3>Total Scraped</h3><div class="metric">{{ last_run.total_scraped if last_run else '—' }}</div></div>
+                  <div class="card"><h3>Created</h3><div class="metric">{{ last_run.created if last_run else '—' }}</div></div>
+                  <div class="card"><h3>Updated</h3><div class="metric">{{ last_run.updated if last_run else '—' }}</div></div>
+                  <div class="card"><h3>Skipped</h3><div class="metric">{{ last_run.skipped if last_run else '—' }}</div></div>
+                </section>
+
+                <section class="card" style="margin-top: 1rem;">
+                  <h2>Last Run Summary</h2>
+                  {% if last_run %}
+                    <p>Status: <span class="{{ 'ok' if last_run.ok else 'bad' }}">{{ 'success' if last_run.ok else 'failed' }}</span></p>
+                    <p>Started: {{ last_run.started_at }} | Finished: {{ last_run.finished_at }}</p>
+                    <p>Categories written: {{ last_run.categories_written }}</p>
+                    <h3>Warnings</h3>
+                    {% if last_run.warnings %}<ul>{% for warning in last_run.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>{% else %}<p>None</p>{% endif %}
+                    <h3>Errors</h3>
+                    {% if last_run.errors %}<ul>{% for error in last_run.errors %}<li>{{ error }}</li>{% endfor %}</ul>{% else %}<p>None</p>{% endif %}
+                    <details><summary>Raw JSON</summary><pre>{{ last_run_json }}</pre></details>
+                  {% else %}
+                    <p>No run has been triggered in this server process yet. Use the button above or call <code>POST /run</code>.</p>
+                  {% endif %}
+                </section>
+              </main>
+              <script>
+                document.getElementById('run-scraper').addEventListener('click', async () => {
+                  const status = document.getElementById('run-status');
+                  const button = document.getElementById('run-scraper');
+                  button.disabled = true;
+                  status.textContent = 'Running scraper...';
+                  try {
+                    const response = await fetch('/run', { method: 'POST' });
+                    const payload = await response.json();
+                    status.textContent = payload.ok ? 'Run finished. Refreshing dashboard...' : 'Run failed. Refreshing dashboard...';
+                    setTimeout(() => window.location.reload(), 900);
+                  } catch (error) {
+                    status.textContent = `Run request failed: ${error}`;
+                    button.disabled = false;
+                  }
+                });
+              </script>
+            </body>
+            </html>
             """,
-            categories=categories,
+            health=health,
+            last_run=last_run,
+            last_run_json=json.dumps(last_run, indent=2, sort_keys=True) if last_run else "{}",
         )
-
-    @app.get("/portal")
-    def portal():
-        email = normalize_text(request.args.get("email", "")).lower()
-        if not email:
-            return jsonify({"ok": False, "error": "Provide ?email=you@example.com"}), 400
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute("SELECT id, company_name, capabilities FROM firms WHERE email = ? ORDER BY id DESC LIMIT 1", (email,))
-        firm = cur.fetchone()
-        if not firm:
-            conn.close()
-            return jsonify({"ok": False, "error": "Firm not found"}), 404
-        firm_id, company_name, capabilities = firm
-        cur.execute("SELECT id, scope_number, categories, status, created_at FROM matches WHERE firm_id = ? ORDER BY created_at DESC", (firm_id,))
-        matches = cur.fetchall()
-        conn.close()
-        return render_template_string(
-            """
-            <h2>{{ company_name }} Portal</h2>
-            <p>Capabilities: {{ capabilities }}</p>
-            <h3>Your Matches</h3>
-            <ul>
-            {% for m in matches %}
-              <li>
-                Scope {{ m[1] }} | {{ m[2] }} | Status: {{ m[3] }}
-                {% if m[3] == 'pending' %}
-                  <a href="{{ url_for('decide_match', match_id=m[0], decision='accept') }}">Accept</a>
-                  <a href="{{ url_for('decide_match', match_id=m[0], decision='pass') }}">Pass</a>
-                {% endif %}
-              </li>
-            {% else %}
-              <li>No matches yet. We will keep checking as opportunities update.</li>
-            {% endfor %}
-            </ul>
-            """,
-            company_name=company_name,
-            capabilities=capabilities,
-            matches=matches,
-        )
-
-    @app.get("/match/<int:match_id>/<decision>")
-    def decide_match(match_id: int, decision: str):
-        if decision not in {"accept", "pass"}:
-            return jsonify({"ok": False, "error": "Invalid decision"}), 400
-        conn = sqlite3.connect(db_path)
-        conn.execute("UPDATE matches SET status = ? WHERE id = ?", (decision, match_id))
-        conn.commit()
-        conn.close()
-        logger.info("Match decision recorded match_id=%s decision=%s", match_id, decision)
-        return jsonify({"ok": True, "match_id": match_id, "decision": decision})
 
     @app.get("/health")
     def health():
-        return jsonify(
-            {
-                "ok": True,
-                "service": "bbb-bridge-crm",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "scheduler": {"timezone": SCHEDULER_TIMEZONE, "hour": SCHEDULER_HOUR, "minute": SCHEDULER_MINUTE},
-            }
-        )
+        return jsonify(health_payload())
 
     @app.post("/run")
     def trigger():
         scrape_result = run_once()
-        match_result = match_firms_to_opportunities(db_path) if scrape_result.get("ok") else 0
         status = 200 if scrape_result.get("ok") else 500
-        return jsonify({"ok": bool(scrape_result.get("ok")), "scrape": scrape_result, "new_matches": match_result}), status
+        return jsonify({"ok": bool(scrape_result.get("ok")), "scrape": scrape_result}), status
 
     return app
 
@@ -727,7 +789,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Be Brown Brave BRIDGE CRM backend")
     parser.add_argument("--once", action="store_true", help="Run one opportunity sync immediately")
     parser.add_argument("--schedule", action="store_true", help="Run 2:00 AM ET daily scheduler")
-    parser.add_argument("--serve", action="store_true", help="Start customer-facing web app")
+    parser.add_argument("--serve", action="store_true", help="Start internal admin web app")
     parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"), help="Web server host")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8787")), help="Web server port")
     args = parser.parse_args()

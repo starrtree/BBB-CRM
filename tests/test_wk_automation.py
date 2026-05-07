@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from src.wk_automation import (
     Opportunity,
     build_airtable_fields,
@@ -84,3 +86,33 @@ def test_markdown_parser_handles_spaced_deadline_header():
     rows = parse_markdown_table(md)
     assert len(rows) == 1
     assert rows[0].quotes_due == "2026-06-01"
+
+
+def test_admin_dashboard_route_if_flask_installed(tmp_path: Path):
+    pytest.importorskip("flask")
+    from src.wk_automation import create_app
+
+    app = create_app(tmp_path / "admin.db")
+    client = app.test_client()
+
+    response = client.get("/admin")
+    assert response.status_code == 200
+    assert b"Be Brown Brave BRIDGE CRM Admin" in response.data
+    assert b"Run Opportunity Scraper Now" in response.data
+    assert b"Run Matching Now" in response.data
+
+
+def test_health_endpoint_does_not_expose_secrets(tmp_path: Path, monkeypatch):
+    pytest.importorskip("flask")
+    from src.wk_automation import create_app
+
+    monkeypatch.setenv("AIRTABLE_API_KEY", "pat_secret_should_not_render")
+    app = create_app(tmp_path / "health.db")
+    client = app.test_client()
+
+    response = client.get("/health")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["airtable"]["api_key_configured"] is True
+    assert "pat_secret_should_not_render" not in response.get_data(as_text=True)

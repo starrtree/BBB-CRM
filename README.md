@@ -1,6 +1,8 @@
 # Be Brown Brave BRIDGE CRM Backend
 
-Backend for the Be Brown Brave BRIDGE CRM. It currently supports daily Walsh Kokosing opportunity scraping, Airtable opportunity upserts, structured run summaries, and a lightweight firm-intake/match-decision web MVP.
+Backend for the Be Brown Brave BRIDGE CRM. It currently supports daily Walsh Kokosing opportunity scraping, Airtable opportunity upserts, structured run summaries, and a lightweight **internal admin dashboard** for monitoring/manual runs.
+
+> Security warning: `/admin` is intentionally unauthenticated for this internal MVP. Do **not** expose it publicly without adding authentication, IP allowlisting, VPN access, or another access-control layer.
 
 ## Current status
 
@@ -14,15 +16,18 @@ Backend for the Be Brown Brave BRIDGE CRM. It currently supports daily Walsh Kok
 - Airtable transient retry handling for 408/409/425/429/5xx responses.
 - Automatic `Last Scraped` updates on every Airtable payload.
 - Automatic retry without `Categories` if the field does not exist yet.
-- `GET /health` and `POST /run` JSON endpoints.
+- `GET /health`, `POST /run`, and `GET /admin` endpoints.
 - Daily scheduler at `2:00 AM America/New_York`.
-- Local SQLite firm intake + local deterministic match MVP.
+- Internal dashboard showing health, scheduler config, Airtable config status, last run summary, scrape path, totals, created/updated/skipped counts, and warnings/errors.
 
-### Partially complete
+### Intentionally not built yet
 
-- Customer-facing firm portal exists, but it is still an MVP and should not be considered a full authenticated customer account system.
-- Firm matching is deterministic category overlap only; AI matching/scoring is prepared for future expansion but not fully implemented.
-- Notifications are not sent yet; accept/pass decisions are stored locally only.
+- Public customer portal.
+- Customer account creation/authentication.
+- Public firm intake.
+- Customer accept/pass notification workflow.
+
+Airtable remains the main CRM interface. This app is a backend automation/admin monitor, not a replacement CRM.
 
 ### Still needed for production CRM phase
 
@@ -30,8 +35,8 @@ Backend for the Be Brown Brave BRIDGE CRM. It currently supports daily Walsh Kok
 - Airtable Notifications Logs writes.
 - AI firm-opportunity matching and certification priority scoring.
 - Email/SMS notification routing with accept/pass links.
-- Real authentication or magic-link portal access.
-- Production database such as Postgres if the customer-facing portal becomes persistent production infrastructure.
+- Authentication or admin-only network protection for `/admin`.
+- Production persistence if future customer-facing features are added.
 
 ## Airtable configuration
 
@@ -87,7 +92,7 @@ set +a
 python src/wk_automation.py --once
 ```
 
-### Customer-facing web app
+### Internal admin dashboard
 
 ```bash
 python src/wk_automation.py --serve --host 0.0.0.0 --port 8787
@@ -95,9 +100,20 @@ python src/wk_automation.py --serve --host 0.0.0.0 --port 8787
 
 Open:
 
-- `http://localhost:8787/`
-- `http://localhost:8787/intake`
-- `http://localhost:8787/portal?email=firm@example.com`
+- `http://localhost:8787/admin`
+- `http://localhost:8787/health`
+
+The dashboard includes:
+
+- backend health status
+- scheduler configuration
+- Airtable base/table config status, without secrets
+- last run summary, if available
+- scrape path used (`firecrawl`, `direct_html`, or `none`)
+- total scraped, created, updated, and skipped counts
+- errors/warnings
+- a **Run Opportunity Scraper Now** button that calls `POST /run`
+- a disabled **Run Matching Now** placeholder for the future matching phase
 
 ### Scheduled mode
 
@@ -111,11 +127,15 @@ The scheduler runs daily at `2:00 AM America/New_York`.
 
 ### `GET /health`
 
-Returns service status, timestamp, and scheduler configuration.
+Returns service status, timestamp, scheduler configuration, and Airtable config status. It does not expose API keys or secrets.
 
 ### `POST /run`
 
-Runs the opportunity scrape + Airtable upsert, then runs local deterministic matching if the scrape succeeds. Returns a structured JSON summary with scrape path, row counts, created/updated counts, category-write status, and errors.
+Runs the opportunity scrape + Airtable upsert. Returns a structured JSON summary with scrape path, row counts, created/updated/skipped counts, category-write status, warnings, and errors.
+
+### `GET /admin`
+
+Renders the internal admin dashboard. This page is for operators/admins only and should not be publicly exposed until authentication or network controls are added.
 
 ## Deployment: Hostinger VPS
 
@@ -126,6 +146,7 @@ Runs the opportunity scrape + Airtable upsert, then runs local deterministic mat
 5. Install dependencies.
 6. Set environment variables in a systemd service file or a private `.env` outside Git.
 7. Run with Gunicorn for the web app.
+8. Put `/admin` behind Nginx basic auth, IP allowlisting, VPN, or another admin-only protection before internet exposure.
 
 Example commands:
 
@@ -149,6 +170,12 @@ Health check URL:
 curl http://localhost:8787/health
 ```
 
+Manual run URL:
+
+```bash
+curl -X POST http://localhost:8787/run
+```
+
 ## Deployment: Render or Railway
 
 Build/install command:
@@ -169,7 +196,7 @@ Add environment variables in the platform dashboard. For scheduled syncs, use th
 python src/wk_automation.py --once
 ```
 
-If the platform does not provide persistent disk, do not rely on the local SQLite firm portal for production. Move firm/match persistence to Airtable or Postgres in the next phase.
+If deployed on a public app host, do not leave `/admin` publicly reachable without auth or platform-level access controls.
 
 ## Troubleshooting
 
@@ -194,10 +221,10 @@ If the platform does not provide persistent disk, do not rely on the local SQLit
 - Date fields are only sent when parseable as ISO dates.
 - Non-date strings are logged and skipped for date columns to avoid Airtable date-field rejection.
 
-### Local web portal data disappears
+### Admin dashboard has no last run
 
-- The current MVP uses SQLite at `data/app.db` by default.
-- On ephemeral hosts, use Airtable or Postgres for production persistence in the next phase.
+- Last run summary is stored in memory for the current server process.
+- Click **Run Opportunity Scraper Now** on `/admin` or call `POST /run` to populate it.
 
 ## Testing
 
@@ -208,10 +235,10 @@ python -m pytest -q
 
 ## CRM expansion architecture
 
-The current architecture keeps the opportunity scraper/upserter separate from local firm intake and deterministic matching. Next production phases should add:
+The current architecture keeps the opportunity scraper/upserter separate from future customer-facing CRM features. Next production phases should add:
 
 1. `FirmsRepository` for Airtable Firms table reads/writes.
 2. `NotificationsRepository` for Airtable Notifications Logs writes.
 3. `MatchingService` with AI scoring, certification priority, availability windows, and trade/category fit.
 4. Notification adapters for email/SMS with signed accept/pass URLs.
-5. Auth or magic-link access so firms can see only their own matches safely.
+5. Auth or admin-only access so internal pages are protected safely.
