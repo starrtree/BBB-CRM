@@ -54,3 +54,33 @@ def test_ensure_db_creates_tables(tmp_path: Path):
     db_path = tmp_path / "app.db"
     ensure_db(db_path)
     assert db_path.exists()
+
+
+def test_markdown_parser_skips_malformed_rows_without_scope_number():
+    md = """
+| Scope Number | Phase | Scope Description | Price Range | Scope Status | Release for Bid | Quotes Due |
+| --- | --- | --- | --- | --- | --- | --- |
+|  | A | Missing scope | $10k | Open | TBD | Deferred |
+| 42 | B | Asphalt paving | $20k | Open | TBD | Deferred |
+"""
+    rows = parse_markdown_table(md)
+    assert len(rows) == 1
+    assert rows[0].scope_number == "42"
+
+
+def test_build_airtable_fields_skips_unparseable_dates():
+    opp = Opportunity(scope_number="99", scope_description="General construction", release_for_bid="TBD", quotes_due="Deferred")
+    fields = build_airtable_fields(opp)
+    assert "Release for Bid" not in fields
+    assert "Deadline/Quotes Due" not in fields
+
+
+def test_markdown_parser_handles_spaced_deadline_header():
+    md = """
+| Scope Number | Deadline / Quotes Due | Scope Description |
+| --- | --- | --- |
+| 77 | 2026-06-01 | Drainage utilities |
+"""
+    rows = parse_markdown_table(md)
+    assert len(rows) == 1
+    assert rows[0].quotes_due == "2026-06-01"
