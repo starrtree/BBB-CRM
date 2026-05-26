@@ -657,81 +657,199 @@ def create_app(db_path: Path = DEFAULT_DB_PATH):
               <meta name="viewport" content="width=device-width, initial-scale=1">
               <title>BBB BRIDGE CRM Admin</title>
               <style>
-                :root { color-scheme: light; font-family: Arial, sans-serif; }
-                body { margin: 0; background: #f6f7fb; color: #172033; }
-                header { background: #2b2118; color: #fff; padding: 1.25rem 2rem; }
-                main { max-width: 1100px; margin: 0 auto; padding: 1.5rem; }
-                .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
-                .card { background: #fff; border: 1px solid #dde2ec; border-radius: 12px; padding: 1rem; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
-                .metric { font-size: 2rem; font-weight: 700; margin: .25rem 0; }
-                .ok { color: #0f7b3f; font-weight: 700; }
-                .warn { color: #9f5f00; font-weight: 700; }
-                .bad { color: #b42318; font-weight: 700; }
-                button { background: #5b3b22; border: 0; color: #fff; padding: .7rem 1rem; border-radius: 8px; cursor: pointer; }
-                button[disabled] { background: #a7a7a7; cursor: not-allowed; }
-                pre { background: #101828; color: #eef4ff; padding: 1rem; border-radius: 10px; overflow-x: auto; }
-                ul { padding-left: 1.25rem; }
-                .actions { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
+                :root {
+                  --bg: #f7f2ec;
+                  --panel: #fffaf5;
+                  --panel-strong: #fff;
+                  --ink: #2f241c;
+                  --muted: #7b6655;
+                  --brown-700: #5f3a24;
+                  --brown-500: #8a5a3a;
+                  --orange-400: #f1a24f;
+                  --orange-300: #ffd39f;
+                  --blue-600: #1f5faa;
+                  --blue-400: #5ea1e8;
+                  --ok: #1f7a3f;
+                  --warn: #9a5c00;
+                  --bad: #b42318;
+                }
+                * { box-sizing: border-box; }
+                body {
+                  margin: 0;
+                  font-family: Inter, Segoe UI, Arial, sans-serif;
+                  background: radial-gradient(circle at top right, #fff5e9 0%, var(--bg) 38%, #f3eee7 100%);
+                  color: var(--ink);
+                }
+                .layout { display: grid; grid-template-columns: 280px 1fr; min-height: 100vh; }
+                .sidebar {
+                  background: linear-gradient(180deg, #3c2618 0%, #5a3421 54%, #7a4a2a 100%);
+                  color: #fff;
+                  padding: 1.5rem 1.2rem;
+                  border-right: 3px solid rgba(94,161,232,.7);
+                }
+                .brand { font-size: 1.35rem; font-weight: 800; letter-spacing: .3px; margin-bottom: .75rem; }
+                .tagline { font-size: .92rem; line-height: 1.5; color: #ffe9d4; margin-bottom: 1.5rem; }
+                .nav-item {
+                  display: block;
+                  margin-bottom: .55rem;
+                  padding: .6rem .7rem;
+                  border-radius: 10px;
+                  color: #fff;
+                  text-decoration: none;
+                  background: rgba(255,255,255,.08);
+                  border: 1px solid rgba(94,161,232,.35);
+                }
+                .nav-item.active { background: rgba(241,162,79,.28); border-color: rgba(255,211,159,.7); }
+                .nav-foot { margin-top: 1.2rem; font-size: .82rem; color: #ffe0bf; }
+                .content { padding: 1.4rem 1.7rem; }
+                .hero {
+                  background: linear-gradient(120deg, #fffaf5 0%, #fff 70%);
+                  border: 2px solid var(--blue-400);
+                  border-radius: 18px;
+                  padding: 1.1rem 1.2rem;
+                  box-shadow: 0 10px 30px rgba(31,95,170,.08);
+                  margin-bottom: 1rem;
+                }
+                .hero h1 { margin: 0 0 .3rem 0; color: var(--brown-700); }
+                .hero p { margin: 0; color: var(--muted); }
+                .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .9rem; }
+                .card {
+                  background: var(--panel-strong);
+                  border: 1px solid #e6d6c6;
+                  border-left: 4px solid var(--blue-400);
+                  border-radius: 14px;
+                  padding: .95rem;
+                  box-shadow: 0 2px 7px rgba(47,36,28,.06);
+                }
+                .card h2, .card h3 { margin: 0 0 .45rem 0; color: var(--brown-700); }
+                .metric { font-size: 2rem; font-weight: 800; color: var(--brown-500); }
+                .ok { color: var(--ok); font-weight: 700; }
+                .warn { color: var(--warn); font-weight: 700; }
+                .bad { color: var(--bad); font-weight: 700; }
+                .actions { display: flex; flex-wrap: wrap; gap: .75rem; }
+                button {
+                  background: linear-gradient(180deg, var(--brown-500), var(--brown-700));
+                  border: 2px solid var(--blue-400);
+                  color: #fff;
+                  padding: .7rem .95rem;
+                  border-radius: 10px;
+                  font-weight: 700;
+                  cursor: pointer;
+                }
+                button:hover { filter: brightness(1.05); }
+                button[disabled] {
+                  background: #b9ab9d;
+                  border-color: #c6d7ea;
+                  color: #fff;
+                  cursor: not-allowed;
+                }
+                .panel {
+                  margin-top: .95rem;
+                  background: var(--panel);
+                  border: 1px solid #ecdcc9;
+                  border-radius: 14px;
+                  padding: .95rem;
+                }
+                .panel h2 { margin-top: 0; color: var(--brown-700); }
+                ul { margin: .4rem 0; padding-left: 1.1rem; }
+                li { margin: .25rem 0; }
+                pre {
+                  background: #1c2a3a;
+                  color: #ebf5ff;
+                  padding: .9rem;
+                  border-radius: 10px;
+                  overflow-x: auto;
+                  border: 1px solid #3e6ea3;
+                }
+                .pill {
+                  display: inline-block;
+                  padding: .2rem .55rem;
+                  border-radius: 100px;
+                  font-size: .82rem;
+                  background: #fff0de;
+                  border: 1px solid #f3c48e;
+                  color: #7a4828;
+                }
+                @media (max-width: 980px) {
+                  .layout { grid-template-columns: 1fr; }
+                  .sidebar { border-right: 0; border-bottom: 3px solid rgba(94,161,232,.7); }
+                }
               </style>
             </head>
             <body>
-              <header>
-                <h1>Be Brown Brave BRIDGE CRM Admin</h1>
-                <p>Internal automation monitor. Airtable remains the CRM source of truth.</p>
-              </header>
-              <main>
-                <section class="grid">
-                  <div class="card">
-                    <h2>Backend Health</h2>
-                    <p class="{{ 'ok' if health.ok else 'bad' }}">{{ 'Healthy' if health.ok else 'Unhealthy' }}</p>
-                    <p>Timestamp: {{ health.timestamp }}</p>
-                  </div>
-                  <div class="card">
-                    <h2>Scheduler</h2>
-                    <p>{{ health.scheduler.hour }}:{{ '%02d'|format(health.scheduler.minute) }} {{ health.scheduler.timezone }}</p>
-                  </div>
-                  <div class="card">
-                    <h2>Airtable Config</h2>
-                    <p>Base: <span class="{{ 'ok' if health.airtable.base_configured else 'bad' }}">{{ 'configured' if health.airtable.base_configured else 'missing' }}</span></p>
-                    <p>Opportunities table: <span class="{{ 'ok' if health.airtable.opportunities_table_configured else 'bad' }}">{{ health.airtable.opportunities_table or 'missing' }}</span></p>
-                    <p>API key: <span class="{{ 'ok' if health.airtable.api_key_configured else 'bad' }}">{{ 'configured' if health.airtable.api_key_configured else 'missing' }}</span></p>
-                    <p>Firecrawl: <span class="{{ 'ok' if health.airtable.firecrawl_configured else 'warn' }}">{{ 'configured' if health.airtable.firecrawl_configured else 'not configured; direct HTML fallback will be used' }}</span></p>
-                  </div>
-                </section>
+              <div class="layout">
+                <aside class="sidebar">
+                  <div class="brand">BBB BRIDGE CRM</div>
+                  <div class="tagline">Supporting diversity in professional workspaces — with emphasis on women of color in construction and contracting opportunities.</div>
+                  <a class="nav-item active" href="/admin">Admin Dashboard</a>
+                  <a class="nav-item" href="/health">System Health (JSON)</a>
+                  <a class="nav-item" href="#run-actions">Run Controls</a>
+                  <div class="nav-foot">Internal tooling only. Airtable remains the primary CRM interface.</div>
+                </aside>
+                <main class="content">
+                  <section class="hero">
+                    <h1>Operations Dashboard</h1>
+                    <p>Monitor automation health, review sync outcomes, and run opportunity updates manually when needed.</p>
+                  </section>
 
-                <section class="card" style="margin-top: 1rem;">
-                  <h2>Actions</h2>
-                  <div class="actions">
-                    <button id="run-scraper">Run Opportunity Scraper Now</button>
-                    <button disabled title="Future phase: matching orchestration will be enabled after admin auth and notification routing are designed.">Run Matching Now (coming later)</button>
-                  </div>
-                  <p id="run-status" class="warn"></p>
-                </section>
+                  <section class="grid">
+                    <div class="card">
+                      <h3>Backend Health</h3>
+                      <div class="{{ 'ok' if health.ok else 'bad' }}">{{ 'Healthy' if health.ok else 'Unhealthy' }}</div>
+                      <p><span class="pill">Updated: {{ health.timestamp }}</span></p>
+                    </div>
+                    <div class="card">
+                      <h3>Scheduler</h3>
+                      <p><strong>{{ health.scheduler.hour }}:{{ '%02d'|format(health.scheduler.minute) }}</strong> {{ health.scheduler.timezone }}</p>
+                      <p class="warn">Daily automated run window.</p>
+                    </div>
+                    <div class="card">
+                      <h3>Airtable Status</h3>
+                      <p>Base: <span class="{{ 'ok' if health.airtable.base_configured else 'bad' }}">{{ 'configured' if health.airtable.base_configured else 'missing' }}</span></p>
+                      <p>Table: <span class="{{ 'ok' if health.airtable.opportunities_table_configured else 'bad' }}">{{ health.airtable.opportunities_table or 'missing' }}</span></p>
+                      <p>API key: <span class="{{ 'ok' if health.airtable.api_key_configured else 'bad' }}">{{ 'configured' if health.airtable.api_key_configured else 'missing' }}</span></p>
+                    </div>
+                    <div class="card">
+                      <h3>Scraper Mode</h3>
+                      <p><span class="pill">Firecrawl: {{ 'enabled' if health.airtable.firecrawl_configured else 'not set (direct HTML fallback)' }}</span></p>
+                    </div>
+                  </section>
 
-                <section class="grid" style="margin-top: 1rem;">
-                  <div class="card"><h3>Scrape Path</h3><div class="metric">{{ last_run.scrape_path if last_run else '—' }}</div></div>
-                  <div class="card"><h3>Total Scraped</h3><div class="metric">{{ last_run.total_scraped if last_run else '—' }}</div></div>
-                  <div class="card"><h3>Created</h3><div class="metric">{{ last_run.created if last_run else '—' }}</div></div>
-                  <div class="card"><h3>Updated</h3><div class="metric">{{ last_run.updated if last_run else '—' }}</div></div>
-                  <div class="card"><h3>Skipped</h3><div class="metric">{{ last_run.skipped if last_run else '—' }}</div></div>
-                </section>
+                  <section id="run-actions" class="panel">
+                    <h2>Run Controls</h2>
+                    <div class="actions">
+                      <button id="run-scraper">Run Opportunity Scraper Now</button>
+                      <button disabled title="Future phase: matching orchestration will be enabled after admin auth and notification routing are designed.">Run Matching Now (coming later)</button>
+                    </div>
+                    <p id="run-status" class="warn"></p>
+                  </section>
 
-                <section class="card" style="margin-top: 1rem;">
-                  <h2>Last Run Summary</h2>
-                  {% if last_run %}
-                    <p>Status: <span class="{{ 'ok' if last_run.ok else 'bad' }}">{{ 'success' if last_run.ok else 'failed' }}</span></p>
-                    <p>Started: {{ last_run.started_at }} | Finished: {{ last_run.finished_at }}</p>
-                    <p>Categories written: {{ last_run.categories_written }}</p>
-                    <h3>Warnings</h3>
-                    {% if last_run.warnings %}<ul>{% for warning in last_run.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>{% else %}<p>None</p>{% endif %}
-                    <h3>Errors</h3>
-                    {% if last_run.errors %}<ul>{% for error in last_run.errors %}<li>{{ error }}</li>{% endfor %}</ul>{% else %}<p>None</p>{% endif %}
-                    <details><summary>Raw JSON</summary><pre>{{ last_run_json }}</pre></details>
-                  {% else %}
-                    <p>No run has been triggered in this server process yet. Use the button above or call <code>POST /run</code>.</p>
-                  {% endif %}
-                </section>
-              </main>
+                  <section class="grid" style="margin-top: .95rem;">
+                    <div class="card"><h3>Scrape Path</h3><div class="metric">{{ last_run.scrape_path if last_run else '—' }}</div></div>
+                    <div class="card"><h3>Total Scraped</h3><div class="metric">{{ last_run.total_scraped if last_run else '—' }}</div></div>
+                    <div class="card"><h3>Created</h3><div class="metric">{{ last_run.created if last_run else '—' }}</div></div>
+                    <div class="card"><h3>Updated</h3><div class="metric">{{ last_run.updated if last_run else '—' }}</div></div>
+                    <div class="card"><h3>Skipped</h3><div class="metric">{{ last_run.skipped if last_run else '—' }}</div></div>
+                  </section>
+
+                  <section class="panel">
+                    <h2>Last Run Summary</h2>
+                    {% if last_run %}
+                      <p>Status: <span class="{{ 'ok' if last_run.ok else 'bad' }}">{{ 'success' if last_run.ok else 'failed' }}</span></p>
+                      <p>Started: {{ last_run.started_at }} | Finished: {{ last_run.finished_at }}</p>
+                      <p>Categories written: {{ last_run.categories_written }}</p>
+                      <h3>Warnings</h3>
+                      {% if last_run.warnings %}<ul>{% for warning in last_run.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>{% else %}<p>None</p>{% endif %}
+                      <h3>Errors</h3>
+                      {% if last_run.errors %}<ul>{% for error in last_run.errors %}<li>{{ error }}</li>{% endfor %}</ul>{% else %}<p>None</p>{% endif %}
+                      <details><summary>Raw JSON</summary><pre>{{ last_run_json }}</pre></details>
+                    {% else %}
+                      <p>No run has been triggered in this server process yet. Use the button above or call <code>POST /run</code>.</p>
+                    {% endif %}
+                  </section>
+                </main>
+              </div>
+
               <script>
                 document.getElementById('run-scraper').addEventListener('click', async () => {
                   const status = document.getElementById('run-status');
