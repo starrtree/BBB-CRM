@@ -14,6 +14,12 @@ from .wk_automation import AIRTABLE_API_ROOT, DEFAULT_DB_PATH, AirtableConfig, c
 FIRMS_CACHE: Dict[str, Any] = {"expires_at": 0.0, "payload": None}
 FIRMS_CACHE_SECONDS = int(os.getenv("FIRMS_CACHE_SECONDS", "300"))
 
+OLD_HEART_POINTS_JS = "function heartPoints(count){const pts=[];for(let r=0;r<8;r++)for(let c=0;c<11;c++){const x=c/10*2.6-1.3,y=r/7*2.45-1.15,v=Math.pow(x*x+y*y-1,3)-x*x*Math.pow(y,3);if(v<=.035)pts.push({x:380+x*220,y:345-y*210})}return pts.sort((a,b)=>a.y-b.y||a.x-b.x).slice(0,count)}"
+NEW_HEART_POINTS_JS = "function heartPoints(count){let density=Math.max(16,Math.ceil(Math.sqrt(count*2.4))),pts=[];while(pts.length<count&&density<=180){pts=[];const cols=density,rows=Math.max(12,Math.ceil(density*.9));for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){const x=c/(cols-1)*2.6-1.3,y=r/(rows-1)*2.45-1.15,v=Math.pow(x*x+y*y-1,3)-x*x*Math.pow(y,3);if(v<=.035)pts.push({x:380+x*220,y:345-y*210})}density+=4}pts.sort((a,b)=>a.y-b.y||a.x-b.x);if(pts.length<count){for(let i=pts.length;i<count;i++){const t=i/count*Math.PI*2,x=16*Math.pow(Math.sin(t),3),y=13*Math.cos(t)-5*Math.cos(2*t)-2*Math.cos(3*t)-Math.cos(4*t);pts.push({x:380+x*13,y:350-y*13})}}return pts.slice(0,count)}"
+
+OLD_NODE_LAYOUT_JS = "n.style.left=pts[i].x+'px';n.style.top=pts[i].y+'px';n.textContent=f.logo;"
+NEW_NODE_LAYOUT_JS = "n.style.left=pts[i].x+'px';n.style.top=pts[i].y+'px';const nodeSize=Math.max(18,Math.min(70,520/Math.sqrt(firms.length)));n.style.width=nodeSize+'px';n.style.height=Math.max(16,nodeSize*.82)+'px';n.style.borderRadius=Math.max(6,nodeSize*.24)+'px';n.style.fontSize=Math.max(7,nodeSize*.22)+'px';n.textContent=f.logo;"
+
 
 def _norm_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
@@ -170,6 +176,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH):
             )
         elif request.path == "/crm":
             html = html.replace("const firms=", "let firms=", 1)
+            html = html.replace(OLD_HEART_POINTS_JS, NEW_HEART_POINTS_JS, 1)
+            html = html.replace(OLD_NODE_LAYOUT_JS, NEW_NODE_LAYOUT_JS, 1)
             html = html.replace(
                 "renderStats();renderFilters();renderAll();updateTransform();",
                 "async function loadLiveFirms(){try{const response=await fetch('/api/firms');const payload=await response.json();if(payload.ok&&Array.isArray(payload.firms)&&payload.firms.length){firms=payload.firms;renderStats();renderAll();}}catch(error){console.warn('Using demo firm data because live Airtable firms could not load',error);}}renderStats();renderFilters();renderAll();updateTransform();loadLiveFirms();",
