@@ -9,16 +9,26 @@ from urllib.parse import quote
 
 from flask import jsonify, redirect, render_template, request
 
-from .wk_automation import AIRTABLE_API_ROOT, DEFAULT_DB_PATH, AirtableConfig, create_app as create_backend_app, health_payload
+from .wk_automation import (
+    AIRTABLE_API_ROOT,
+    DEFAULT_DB_PATH,
+    AirtableConfig,
+    create_app as create_backend_app,
+    health_payload,
+)
 
 FIRMS_CACHE: Dict[str, Any] = {"expires_at": 0.0, "payload": None}
 FIRMS_CACHE_SECONDS = int(os.getenv("FIRMS_CACHE_SECONDS", "300"))
 
-OLD_HEART_POINTS_JS = "function heartPoints(count){const pts=[];for(let r=0;r<8;r++)for(let c=0;c<11;c++){const x=c/10*2.6-1.3,y=r/7*2.45-1.15,v=Math.pow(x*x+y*y-1,3)-x*x*Math.pow(y,3);if(v<=.035)pts.push({x:380+x*220,y:345-y*210})}return pts.sort((a,b)=>a.y-b.y||a.x-b.x).slice(0,count)}"
-NEW_HEART_POINTS_JS = "function heartPoints(count){let density=Math.max(16,Math.ceil(Math.sqrt(count*2.4))),pts=[];while(pts.length<count&&density<=180){pts=[];const cols=density,rows=Math.max(12,Math.ceil(density*.9));for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){const x=c/(cols-1)*2.6-1.3,y=r/(rows-1)*2.45-1.15,v=Math.pow(x*x+y*y-1,3)-x*x*Math.pow(y,3);if(v<=.035)pts.push({x:380+x*220,y:345-y*210})}density+=4}pts.sort((a,b)=>a.y-b.y||a.x-b.x);if(pts.length<count){for(let i=pts.length;i<count;i++){const t=i/count*Math.PI*2,x=16*Math.pow(Math.sin(t),3),y=13*Math.cos(t)-5*Math.cos(2*t)-2*Math.cos(3*t)-Math.cos(4*t);pts.push({x:380+x*13,y:350-y*13})}}return pts.slice(0,count)}"
+ORIGINAL_HEART_POINTS_JS = "function heartPoints(count){const pts=[];for(let r=0;r<8;r++)for(let c=0;c<11;c++){const x=c/10*2.6-1.3,y=r/7*2.45-1.15,v=Math.pow(x*x+y*y-1,3)-x*x*Math.pow(y,3);if(v<=.035)pts.push({x:380+x*220,y:345-y*210})}return pts.sort((a,b)=>a.y-b.y||a.x-b.x).slice(0,count)}"
 
-OLD_NODE_LAYOUT_JS = "n.style.left=pts[i].x+'px';n.style.top=pts[i].y+'px';n.textContent=f.logo;"
-NEW_NODE_LAYOUT_JS = "n.style.left=pts[i].x+'px';n.style.top=pts[i].y+'px';const nodeSize=Math.max(18,Math.min(70,520/Math.sqrt(firms.length)));n.style.width=nodeSize+'px';n.style.height=Math.max(16,nodeSize*.82)+'px';n.style.borderRadius=Math.max(6,nodeSize*.24)+'px';n.style.fontSize=Math.max(7,nodeSize*.22)+'px';n.textContent=f.logo;"
+ACCURATE_HEART_POINTS_JS = "function heartPoints(count){if(count<=0)return[];if(count===1)return[{x:380,y:350}];let cols=Math.max(34,Math.ceil(Math.sqrt(count*2.65))),rows=Math.ceil(cols*.92),candidates=[];while(true){candidates=[];for(let r=0;r<rows;r++){const y=1.35-r/(rows-1)*2.65;for(let c=0;c<cols;c++){const x=-1.4+c/(cols-1)*2.8;const v=Math.pow(x*x+y*y-1,3)-x*x*Math.pow(y,3);if(v<=0)candidates.push({x:380+x*210,y:345-y*205})}}if(candidates.length>=count||cols>=180)break;cols+=4;rows=Math.ceil(cols*.92)}if(candidates.length<=count)return candidates.slice(0,count);const selected=[],stride=(candidates.length-1)/(count-1);for(let i=0;i<count;i++)selected.push(candidates[Math.round(i*stride)]);return selected}"
+
+ORIGINAL_NODE_LAYOUT_JS = "n.style.left=pts[i].x+'px';n.style.top=pts[i].y+'px';n.textContent=f.logo;"
+
+RESPONSIVE_NODE_LAYOUT_JS = "n.style.left=pts[i].x+'px';n.style.top=pts[i].y+'px';const dense=firms.length>450,nodeSize=Math.max(dense?14:18,Math.min(70,(dense?455:520)/Math.sqrt(firms.length)));n.style.width=nodeSize+'px';n.style.height=(dense?nodeSize:Math.max(16,nodeSize*.82))+'px';n.style.borderRadius=(dense?'50%':Math.max(6,nodeSize*.24)+'px');n.style.fontSize=Math.max(7,nodeSize*.22)+'px';n.style.boxShadow=dense?'0 2px 6px rgba(0,0,0,.22)':'';n.textContent=dense?'':f.logo;n.setAttribute('aria-label',f.name);n.title=f.name;"
+
+LIVE_FIRMS_BOOT_JS = "async function loadLiveFirms(){try{const response=await fetch('/api/firms');const payload=await response.json();if(payload.ok&&Array.isArray(payload.firms)&&payload.firms.length){firms=payload.firms;renderStats();renderAll();}}catch(error){console.warn('Using demo firm data because live Airtable firms could not load',error);}}renderStats();renderFilters();renderAll();updateTransform();loadLiveFirms();"
 
 
 def _norm_key(value: str) -> str:
@@ -45,7 +55,15 @@ def _as_list(value: Any) -> List[str]:
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in {"yes", "true", "y", "1", "ready", "matched", "active"}
+    return str(value).strip().lower() in {
+        "yes",
+        "true",
+        "y",
+        "1",
+        "ready",
+        "matched",
+        "active",
+    }
 
 
 def _initials(name: str) -> str:
@@ -72,10 +90,55 @@ def _status(fields: Dict[str, Any], ready: Any, support: Any, matched: Any) -> s
 
 def _normalize_firm(record: Dict[str, Any]) -> Dict[str, Any]:
     fields = record.get("fields", {})
-    name = str(_field(fields, "Business Name", "Firm Name", "Company Name", "Company", "Legal Business Name", "Name", default="Unnamed Firm"))
-    contact = str(_field(fields, "Contact Name", "Primary Contact", "Owner Name", "Business Owner", "Full Name", "Contact", default=""))
-    trade = str(_field(fields, "Industry / Trade", "Industry", "Trade", "Business Field", "Service Category", "Category", "Specialty", default="Other"))
-    capabilities = str(_field(fields, "Capabilities / Services", "Capabilities", "Services", "Business Description", "Description", "Business/Specialty", default="No capabilities listed yet."))
+    name = str(
+        _field(
+            fields,
+            "Business Name",
+            "Firm Name",
+            "Company Name",
+            "Company",
+            "Legal Business Name",
+            "Name",
+            default="Unnamed Firm",
+        )
+    )
+    contact = str(
+        _field(
+            fields,
+            "Contact Name",
+            "Primary Contact",
+            "Owner Name",
+            "Business Owner",
+            "Full Name",
+            "Contact",
+            default="",
+        )
+    )
+    trade = str(
+        _field(
+            fields,
+            "Industry / Trade",
+            "Industry",
+            "Trade",
+            "Business Field",
+            "Service Category",
+            "Category",
+            "Specialty",
+            default="Other",
+        )
+    )
+    capabilities = str(
+        _field(
+            fields,
+            "Capabilities / Services",
+            "Capabilities",
+            "Services",
+            "Business Description",
+            "Description",
+            "Business/Specialty",
+            default="No capabilities listed yet.",
+        )
+    )
     certs = _as_list(_field(fields, "Certifications", "Certification", "Certs", default=[]))
     ready = _field(fields, "Ready to Bid?", "Ready to Bid", "Bid Ready", default="Unknown")
     support = _field(fields, "Needs Support?", "Needs Support", "Support Needed", default="Unknown")
@@ -125,9 +188,19 @@ def _airtable_firms_payload(force_refresh: bool = False) -> Dict[str, Any]:
     api_key = os.getenv("AIRTABLE_API_KEY", "")
     config = AirtableConfig.from_env()
     if not api_key:
-        return {"ok": False, "source": "airtable", "error": "AIRTABLE_API_KEY is not configured", "firms": []}
+        return {
+            "ok": False,
+            "source": "airtable",
+            "error": "AIRTABLE_API_KEY is not configured",
+            "firms": [],
+        }
     if not config.firms_table:
-        return {"ok": False, "source": "airtable", "error": "AIRTABLE_FIRMS_TABLE_ID is not configured", "firms": []}
+        return {
+            "ok": False,
+            "source": "airtable",
+            "error": "AIRTABLE_FIRMS_TABLE_ID is not configured",
+            "firms": [],
+        }
 
     url = f"{AIRTABLE_API_ROOT}/{config.base_id}/{quote(config.firms_table, safe='')}"
     session = requests.Session()
@@ -158,7 +231,6 @@ def create_app(db_path: Path = DEFAULT_DB_PATH):
 
     @app.after_request
     def inject_crm_link(response):
-        """Add CRM navigation and live Airtable fetching to existing templates."""
         if not response.content_type.startswith("text/html"):
             return response
 
@@ -176,11 +248,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH):
             )
         elif request.path == "/crm":
             html = html.replace("const firms=", "let firms=", 1)
-            html = html.replace(OLD_HEART_POINTS_JS, NEW_HEART_POINTS_JS, 1)
-            html = html.replace(OLD_NODE_LAYOUT_JS, NEW_NODE_LAYOUT_JS, 1)
+            html = html.replace(ORIGINAL_HEART_POINTS_JS, ACCURATE_HEART_POINTS_JS, 1)
+            html = html.replace(ORIGINAL_NODE_LAYOUT_JS, RESPONSIVE_NODE_LAYOUT_JS, 1)
             html = html.replace(
                 "renderStats();renderFilters();renderAll();updateTransform();",
-                "async function loadLiveFirms(){try{const response=await fetch('/api/firms');const payload=await response.json();if(payload.ok&&Array.isArray(payload.firms)&&payload.firms.length){firms=payload.firms;renderStats();renderAll();}}catch(error){console.warn('Using demo firm data because live Airtable firms could not load',error);}}renderStats();renderFilters();renderAll();updateTransform();loadLiveFirms();",
+                LIVE_FIRMS_BOOT_JS,
                 1,
             )
         response.set_data(html)
@@ -201,10 +273,18 @@ def create_app(db_path: Path = DEFAULT_DB_PATH):
             payload = _airtable_firms_payload(force_refresh=force_refresh)
             return jsonify(payload), 200 if payload.get("ok") else 500
         except Exception as exc:
-            return jsonify({"ok": False, "source": "airtable", "error": str(exc), "firms": []}), 500
+            return jsonify(
+                {"ok": False, "source": "airtable", "error": str(exc), "firms": []}
+            ), 500
 
     @app.get("/api/firms/mock")
     def mock_firms_api():
-        return jsonify({"ok": True, "source": "mock", "message": "The CRM UI now tries /api/firms first and falls back to demo data if Airtable is unavailable."})
+        return jsonify(
+            {
+                "ok": True,
+                "source": "mock",
+                "message": "The CRM UI tries /api/firms first and falls back to demo data if Airtable is unavailable.",
+            }
+        )
 
     return app
