@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Be Brown Brave CRM</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='crm.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand-icon" aria-hidden="true">♡</div>
+      <h1>Be <span>Brown</span><br>Brave CRM</h1>
+      <p class="brand-copy">Client network and professional CRM for matching firms to opportunity.</p>
+
+      <nav class="side-nav" aria-label="CRM sections">
+        <a href="/admin" class="nav-link"><span>▦</span> Admin</a>
+        <button class="nav-link active" data-page="crm"><span>♡</span> CRM View</button>
+        <button class="nav-link" data-page="firms"><span>▣</span> Firms</button>
+        <button class="nav-link" data-page="matches"><span>⇄</span> Matches</button>
+        <button class="nav-link" data-page="opportunities"><span>▤</span> Opportunities</button>
+        <button class="nav-link" data-page="support"><span>◌</span> Needs Support</button>
+      </nav>
+
+      <blockquote>“Every firm is one piece of a larger heart of opportunity.”</blockquote>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div>
+          <h2 id="pageTitle">Michelle CRM View</h2>
+          <p id="pageSubtitle">Explore the full network, category heart islands, or professional client cards.</p>
+        </div>
+        <label class="search-box">
+          <span aria-hidden="true">⌕</span>
+          <input id="searchInput" type="search" placeholder="Search firms, trades, certifications..." autocomplete="off">
+        </label>
+        <div class="profile"><span>M</span><strong>Michelle</strong></div>
+      </header>
+
+      <div id="dataNotice" class="data-notice loading">Connecting to Airtable…</div>
+
+      <section class="stats" aria-label="Firm summary">
+        <article><strong id="statTotal">0</strong><span>Total Firms</span></article>
+        <article><strong id="statMatched">0</strong><span>Matched</span></article>
+        <article><strong id="statPending">0</strong><span>Pending</span></article>
+        <article><strong id="statSupport">0</strong><span>Needs Support</span></article>
+        <article><strong id="statLost">0</strong><span>No Match</span></article>
+        <article><strong id="statOpportunities">0</strong><span>Opportunities</span></article>
+      </section>
+
+      <section class="workspace">
+        <div class="view-panel">
+          <div class="view-toolbar">
+            <div id="statusFilters" class="filter-row" aria-label="Status filters"></div>
+            <div class="view-switcher" aria-label="View mode">
+              <button class="view-button active" data-mode="heart">Heart View</button>
+              <button class="view-button" data-mode="clusters">Category Hearts</button>
+              <button class="view-button" data-mode="cards">Card View</button>
+            </div>
+          </div>
+
+          <section id="heartView" class="view active" aria-label="Living Heart view">
+            <div id="heartStage" class="heart-stage"><div class="heart-glow"></div></div>
+            <div class="view-hint">Scroll to zoom • drag to pan • hover or click a client</div>
+          </section>
+
+          <section id="clusterView" class="view scroll-view" aria-label="Category heart islands">
+            <div id="clusterGrid" class="cluster-grid"></div>
+          </section>
+
+          <section id="cardsView" class="view scroll-view" aria-label="Firm cards">
+            <div class="category-filter-shell">
+              <div class="category-filter-heading">
+                <strong>Business categories</strong>
+                <button id="clearCategory" type="button">Clear category</button>
+              </div>
+              <div id="categoryFilters" class="category-filters"></div>
+            </div>
+            <div id="cardsGrid" class="cards-grid"></div>
+            <div id="cardLoadMore" class="load-more-wrap"></div>
+          </section>
+
+          <section id="opportunitiesView" class="view scroll-view" aria-label="Opportunities">
+            <div class="opportunity-header">
+              <div><strong>Current Bid Opportunities</strong><p>Live records from the Airtable Opportunities table.</p></div>
+              <button id="refreshOpportunities" type="button">Refresh opportunities</button>
+            </div>
+            <div id="opportunitiesGrid" class="opportunities-grid"></div>
+            <div id="opportunityLoadMore" class="load-more-wrap"></div>
+          </section>
+        </div>
+
+        <aside id="detailPanel" class="detail-panel">
+          <div class="empty-detail">
+            <div class="empty-icon">♡</div>
+            <h3>Select a client</h3>
+            <p>Click a heart node, category node, firm card, or opportunity to open its full details.</p>
+          </div>
+        </aside>
+      </section>
+    </main>
+  </div>
+
+  <div id="tooltip" class="tooltip" role="tooltip"></div>
+  <script src="{{ url_for('static', filename='crm.js') }}" defer></script>
+</body>
+</html>
