@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-SOURCE_URL = "https://www.walshkokosing.com/bsbc-current-opportunities"
+SOURCE_URL = "https://www.walshkokosing.com/whv-current-opportunities"
 FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape"
 AIRTABLE_API_ROOT = "https://api.airtable.com/v0"
 AIRTABLE_BATCH_SIZE = 10
